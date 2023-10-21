@@ -1,3 +1,5 @@
+//! # Control
+//!
 //! The infiniscroll deals with lots of shakey parts by maintaining a limited set
 //! of "desired" state, and the rest is synced to that:
 //!
@@ -18,6 +20,14 @@
 //!
 //! Scrolling, resizing, etc. subsequently "shake" everything to remove wrinkles,
 //! matching everything with the above values, triggering new entry requests, etc.
+//!
+//! # Shake
+//!
+//! Shake has two parts
+//!
+//! 1. Coming up with logical element layout
+//!
+//! 2. Matching the view to that layout
 use std::{
     rc::{
         Rc,
@@ -128,7 +138,7 @@ struct FeedState<Id> {
 
 struct Infiniscroll_<Id: Clone> {
     /// Used when new/resetting
-    reset_time: Id,
+    reset_id: Id,
     frame: El,
     content: El,
     /// Mirrors content's height, used to avoid js round trips (keep in sync)
@@ -140,7 +150,8 @@ struct Infiniscroll_<Id: Clone> {
     feeds: HashMap<FeedId, FeedState<Id>>,
     /// All entries are sorted.
     real: Vec<EntryState<Id>>,
-    anchor_i: usize,
+    /// None if real is empty (i.e. invalid index)
+    anchor_i: Option<usize>,
     anchor_alignment: f64,
     /// Offset of anchor element origin from view (scrolling)/desired content
     /// (recentering) origin.  If alignment is 0 (origin is top of element), has range
@@ -160,27 +171,28 @@ impl<Id: Clone> Infiniscroll_<Id> {
         let old_anchor_i = self.anchor_i;
         let old_anchor_offset = self.anchor_offset;
         if self.real.is_empty() {
-            self.anchor_i = 0;
+            self.anchor_i = None;
             self.anchor_offset = 0.;
         } else {
             let content_origin_y =
                 self.logical_scroll_top as f64 + self.frame.raw().client_height() as f64 * self.anchor_alignment;
-            while let Some(e_state) = self.real.get(self.anchor_i + 1) {
+            let mut anchor_i = self.anchor_i.unwrap();
+            while let Some(e_state) = self.real.get(anchor_i + 1) {
                 if content_origin_y < e_state.top {
                     break;
                 }
-                self.anchor_i += 1;
+                anchor_i += 1;
             }
-            while let Some(e_state) = self.real.get(self.anchor_i) {
+            while let Some(e_state) = self.real.get(anchor_i) {
                 if content_origin_y >= e_state.top {
                     break;
                 }
-                if self.anchor_i == 0 {
+                if anchor_i == 0 {
                     break;
                 }
-                self.anchor_i -= 1;
+                anchor_i -= 1;
             }
-            let anchor = self.real.get(self.anchor_i).unwrap();
+            let anchor = self.real.get(anchor_i).unwrap();
             let anchor_origin_y = anchor.top + anchor.height * self.anchor_alignment;
             self.anchor_offset =
                 (anchor_origin_y -
@@ -188,8 +200,9 @@ impl<Id: Clone> Infiniscroll_<Id> {
                     -anchor.height + anchor.height * self.anchor_alignment,
                     anchor.height * self.anchor_alignment,
                 );
+            self.anchor_i = Some(anchor_i);
         }
-        logd!("Reanchor {} {} to {} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
+        logd!("Reanchor {:?} {} to {:?} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
     }
 
     fn transition_alignment(&mut self) -> bool {
@@ -207,7 +220,7 @@ impl<Id: Clone> Infiniscroll_<Id> {
                 self.anchor_alignment = 1.;
                 logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
                 if self.anchor_alignment != old_anchor_alignment {
-                    self.anchor_i = self.real.len() - 1;
+                    self.anchor_i = Some(self.real.len() - 1);
                     return true;
                 }
                 return false;
@@ -219,7 +232,7 @@ impl<Id: Clone> Infiniscroll_<Id> {
                 self.anchor_alignment = 0.;
                 logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
                 if self.anchor_alignment != old_anchor_alignment {
-                    self.anchor_i = 0;
+                    self.anchor_i = Some(0);
                     return true;
                 }
                 return false;
@@ -276,7 +289,6 @@ fn realize_entry<
     let entry_el = entry.create_el();
     content.ref_push(entry_el.clone());
     let height = entry_el.raw().client_height() as f64;
-    entry_el.ref_remove();
     return EntryState {
         feed_id: feed_id,
         entry: entry,
@@ -300,7 +312,7 @@ impl<Id: Clone> WeakInfiniscroll<Id> {
 pub struct Infiniscroll<Id: Clone>(Rc<RefCell<Infiniscroll_<Id>>>);
 
 impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
-    pub fn new(origin: Id, feeds: Vec<Box<dyn Feed<Id>>>) -> Self {
+    pub fn new(reset_id: Id, feeds: Vec<Box<dyn Feed<Id>>>) -> Self {
         let frame = el("div").classes(&["infinite_frame"]);
         let content = el("div").classes(&["infinite_content"]);
         let center_spinner = el("div").classes(&["center_spinner"]);
@@ -309,7 +321,7 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         frame.ref_extend(vec![content.clone(), center_spinner.clone()]);
         content.ref_extend(vec![early_spinner.clone(), late_spinner.clone()]);
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
-            reset_time: origin,
+            reset_id,
             frame: frame.clone(),
             content: content.clone(),
             logical_content_height: 0.,
@@ -319,7 +331,7 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             late_spinner: late_spinner,
             feeds: HashMap::new(),
             real: vec![],
-            anchor_i: 0,
+            anchor_i: None,
             anchor_alignment: 0.5,
             anchor_offset: 0.,
             delay_update: None,
@@ -435,8 +447,9 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         let mut used_early = 0f64;
         let mut used_late = 0f64;
         if !self1.real.is_empty() {
+            let anchor_i = self1.anchor_i.unwrap();
             {
-                let anchor = &mut self1.real[self1.anchor_i];
+                let anchor = &mut self1.real[anchor_i];
                 let anchor_height = anchor.height;
                 used_early += anchor_height * self1.anchor_alignment
                     // Shift up becomes early usage
@@ -445,10 +458,10 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                     // Shift up reduces late usage
                     + self1.anchor_offset;
             }
-            for e_state in &self1.real[..self1.anchor_i] {
+            for e_state in &self1.real[..anchor_i] {
                 used_early += e_state.height;
             }
-            for e_state in &self1.real[self1.anchor_i + 1..] {
+            for e_state in &self1.real[anchor_i + 1..] {
                 used_late += e_state.height;
             }
         }
@@ -544,22 +557,19 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
 
         // Apply changes
         let dbg_anchor_i = self1.anchor_i;
-        if self1.real.is_empty() {
-            self1.anchor_i += prepend_entries.len() - 1;
-        } else {
-            self1.anchor_i += prepend_entries.len();
+        match self1.anchor_i {
+            Some(anchor_i) => {
+                self1.anchor_i = Some(anchor_i + prepend_entries.len());
+            },
+            None => {
+                if !postpend_entries.is_empty() {
+                    self1.anchor_i = Some(prepend_entries.len());
+                } else {
+                    self1.anchor_i = Some(prepend_entries.len() - 1);
+                }
+            },
         }
-        logd!("prepend; anchor i {} -> {}", dbg_anchor_i, self1.anchor_i);
-        self1
-            .content
-            .ref_extend(
-                prepend_entries
-                    .iter()
-                    .map(|e| &e.entry_el)
-                    .chain(postpend_entries.iter().map(|e| &e.entry_el))
-                    .cloned()
-                    .collect(),
-            );
+        logd!("prepend; anchor i {:?} -> {:?}", dbg_anchor_i, self1.anchor_i);
         prepend_entries.reverse();
         self1.real.splice(0 .. 0, prepend_entries);
         self1.real.extend(postpend_entries);
@@ -580,7 +590,7 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         logd!("want early {}, want late {}", want_early, want_late);
 
         // # Do deferred updates: request more height
-        let new_height = want_early + want_late;
+        let new_height = (want_early + want_late).max(frame_height);
         if (new_height - self1.logical_content_height).abs() >= 1. {
             logd!("requesting height {} -> {}", self1.logical_content_height, new_height);
             self1.logical_content_height = new_height;
@@ -601,24 +611,30 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         // * Manage reserve
         //
         // * Unset stop status if reserve is discarded
+        //
+        // * Adjust anchor alignment
         if !self1.real.is_empty() {
             let mut return_early = 0usize;
             let mut return_late = 0usize;
             let mut edge_off_early;
             let mut edge_off_late;
+            let origin =
+                (1.0 - self1.anchor_alignment) * want_early +
+                    self1.anchor_alignment * (self1.logical_content_height - want_late);
+            let anchor_i = self1.anchor_i.unwrap();
             {
-                let anchor = &mut self1.real[self1.anchor_i];
+                let anchor = &mut self1.real[anchor_i];
                 let anchor_height = anchor.height;
                 edge_off_early = anchor_height * self1.anchor_alignment - self1.anchor_offset;
-                anchor.set_top(want_early - edge_off_early);
+                anchor.set_top(origin - edge_off_early);
                 edge_off_late = anchor_height * (1. - self1.anchor_alignment) + self1.anchor_offset;
             }
-            for e_state in self1.real[..self1.anchor_i].iter_mut().rev() {
+            for e_state in self1.real[..anchor_i].iter_mut().rev() {
                 if edge_off_early > want_early {
                     return_early += 1;
                 } else {
                     edge_off_early += e_state.height;
-                    e_state.set_top(want_early - edge_off_early);
+                    e_state.set_top(origin - edge_off_early);
                 }
             }
             self1
@@ -629,14 +645,14 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 .style()
                 .set_property(
                     "top",
-                    &format!("{}px", want_early - edge_off_early - self1.early_spinner.raw().client_height() as f64),
+                    &format!("{}px", origin - edge_off_early - self1.early_spinner.raw().client_height() as f64),
                 )
                 .unwrap();
-            for e_state in &mut self1.real[self1.anchor_i + 1..] {
+            for e_state in &mut self1.real[anchor_i + 1..] {
                 if edge_off_late > want_late {
                     return_late += 1;
                 } else {
-                    e_state.set_top(want_early + edge_off_late);
+                    e_state.set_top(origin + edge_off_late);
                     edge_off_late += e_state.height;
                 }
             }
@@ -646,11 +662,11 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 .dyn_ref::<HtmlElement>()
                 .unwrap()
                 .style()
-                .set_property("top", &format!("{}px", want_early + edge_off_late))
+                .set_property("top", &format!("{}px", origin + edge_off_late))
                 .unwrap();
             logd!(
                 "return; anchor_i {}; edge_off_early {}, edge_off_late {}, {} before, {} after",
-                self1.anchor_i,
+                anchor_i,
                 edge_off_early,
                 edge_off_late,
                 return_early,
@@ -665,13 +681,13 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 e_state.entry_el.ref_remove();
                 self1.feeds.get_mut(&e_state.feed_id).unwrap().late_reserve.push_front(e_state.entry);
             }
-            self1.anchor_i -= return_early;
+            self1.anchor_i = Some(anchor_i - return_early);
         }
         let mut requesting_early = false;
         let mut requesting_late = false;
         for (feed_id, f_state) in &mut self1.feeds {
             if f_state.initial {
-                f_state.feed.request_around(self1.reset_time.clone(), REQUEST_COUNT);
+                f_state.feed.request_around(self1.reset_id.clone(), REQUEST_COUNT);
                 requesting_early = true;
                 requesting_late = true;
             } else {
@@ -700,6 +716,7 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         self1.center_spinner.ref_modify_classes(&[(CSS_HIDE, self1.real.is_empty() && requesting_early)]);
         self1.early_spinner.ref_modify_classes(&[(CSS_HIDE, !self1.real.is_empty() && requesting_early)]);
         self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !self1.real.is_empty() && requesting_late)]);
+        self1.transition_alignment();
 
         // # Do immediate updates based on logical values: reset scroll (may fail)
         self1.logical_scroll_top = (want_early - frame_height * self1.anchor_alignment).max(0.);
@@ -749,7 +766,7 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         {
             let mut self1 = self.0.borrow_mut();
             let self1 = &mut *self1;
-            if pivot != self1.reset_time {
+            if pivot != self1.reset_id {
                 return;
             }
             let feed = self1.feeds.get_mut(&feed_id).unwrap();
@@ -761,13 +778,14 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             let mut postpend = vec![];
             for e in entries {
                 let time = e.time();
-                if time < self1.reset_time {
+                if time < self1.reset_id {
                     prepend.push(e);
-                } else if time == self1.reset_time {
+                } else if time == self1.reset_id {
                     let real =
                         realize_entry(&self1.content, self1.entry_resize_observer.as_ref().unwrap(), feed_id, e);
-                    self1.content.ref_push(real.entry_el.clone());
+                    logd!("realize initial anchor; id {:?}; height {}", real.entry.time(), real.height);
                     self1.real.push(real);
+                    self1.anchor_i = Some(0);
                 } else {
                     postpend.push(e);
                 }
@@ -873,46 +891,86 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
     pub fn add_entry_after_stop(&self, feed_id: FeedId, entry: Box<dyn Entry<Id>>) {
         {
             let mut self1 = self.0.borrow_mut();
-            if self1.feeds.values().all(|f| f.late_stop) {
-                let time = entry.time();
-                let insert_after_i = bb!{
-                    'find_insert _;
-                    for (i, real_state) in self1.real.iter().enumerate().rev() {
-                        if real_state.entry.time() < time {
-                            break 'find_insert Some(i);
-                        }
-                    }
-                    break None;
-                };
-                if let Some(insert_after_i) = insert_after_i {
-                    let anchor_last = self1.real.is_empty() || self1.anchor_i == self1.real.len() - 1;
-                    let insert_at_end = insert_after_i + 1 == self1.real.len();
-                    let real =
-                        realize_entry(&self1.content, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
-                    self1.content.ref_push(real.entry_el.clone());
-                    self1.real.insert(insert_after_i + 1, real);
-                    if anchor_last {
-                        if insert_at_end {
-                            self1.anchor_i = self1.real.len() - 1;
-                            logd!("realtime, anchor_i reset to last {}", self1.anchor_i);
-                            self1.anchor_offset = 0.;
-                        }
+            let self1 = &mut *self1;
+            let mut stop_all = true;
+            let mut reserves_empty_all = true;
+            for f in self1.feeds.values() {
+                stop_all = stop_all && f.late_stop;
+                reserves_empty_all = reserves_empty_all && f.late_reserve.is_empty();
+            }
+            if stop_all {
+                let feed = self1.feeds.get_mut(&feed_id).unwrap();
+                if !reserves_empty_all {
+                    // Some feeds have unrealized elements, can't realize yet
+                    logd!("realtime; stopped, adding to reserve");
+                    if feed.late_reserve.len() < MAX_RESERVE {
+                        feed.late_reserve.push_back(entry);
+                        logd!("realtime, push late reserve");
                     } else {
-                        if insert_after_i < self1.anchor_i {
-                            self1.anchor_i += 1;
-                            logd!("realtime, insert before; anchor_i {}", self1.anchor_i);
-                        }
+                        logd!("realtime, stop but full, discard, now not stop");
+                        feed.late_stop = false;
                     }
                 } else {
-                    let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                    feed.early_reserve.push_front(entry);
+                    // All feeds stopped, all elements realized, this is the next element so realize
+                    // immediately
+                    let time = entry.time();
+                    let insert_before_i = bb!{
+                        'find_insert _;
+                        for (i, real_state) in self1.real.iter().enumerate().rev() {
+                            if time > real_state.entry.time() {
+                                break 'find_insert i + 1;
+                            }
+                        }
+                        break 0;
+                    };
+                    if insert_before_i == self1.real.len() {
+                        // Insert at end
+                        let real = realize_entry(&self1.content, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
+                        logd!("realtime; id {:?}; height {}", real.entry.time(), real.height);
+                        let anchor_i = self1.anchor_i.unwrap();
+                        if anchor_i == self1.real.len() - 1 {
+                            self1.anchor_i = Some(anchor_i + 1);
+                            logd!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
+                        }
+                        self1.real.push(real);
+                    } else if insert_before_i == 0 {
+                        // Insert at start of early reserve, because insertion is unbounded within
+                        // realized elements (shake will realize it if necessary) OR no real elements
+                        logd!("realtime, push early reserve");
+                        feed.early_reserve.push_front(entry);
+                        if feed.early_reserve.len() > MAX_RESERVE {
+                            feed.early_reserve.truncate(MAX_RESERVE);
+                            feed.early_stop = false;
+                        }
+                    } else {
+                        // Insert within real elements
+                        let real = realize_entry(&self1.content, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
+                        logd!("realtime; id {:?}; height {}", real.entry.time(), real.height);
+                        let anchor_i = self1.anchor_i.unwrap();
+                        if insert_before_i <= anchor_i {
+                            self1.anchor_i = Some(anchor_i + 1);
+                            logd!("realtime, insert before; anchor_i {:?}", self1.anchor_i);
+                        }
+                        self1.real.insert(insert_before_i, real);
+                    }
                 }
             } else {
+                // Some feeds not stopped
                 let feed = self1.feeds.get_mut(&feed_id).unwrap();
                 if !feed.late_stop {
+                    // This feed not stopped; might be a gap, discard - will be fetched in turn
+                    logd!("realtime, not stopped, discard");
                     return;
                 }
-                feed.late_reserve.push_back(entry);
+
+                // This feed is stop, so add to reserve
+                if feed.late_reserve.len() < MAX_RESERVE {
+                    feed.late_reserve.push_back(entry);
+                    logd!("realtime, push late reserve");
+                } else {
+                    logd!("realtime, stop but full, discard, now not stop");
+                    feed.late_stop = false;
+                }
             }
         }
         self.shake();

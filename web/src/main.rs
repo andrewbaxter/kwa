@@ -193,8 +193,8 @@ fn main() {
         }
 
         let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, Some(5000)))]);
-
-        //. let inf2 = Infiniscroll::new(0, vec![Box::new(DemoFeed::new(100, None))]);
-        set_root(vec![hbox(vec![inf1.el()]).own(|_| (inf1))]);
+        let inf2 = Infiniscroll::new(0, vec![Box::new(DemoFeed::new(10, None))]);
+        set_root(vec![hbox(vec![inf1.el(), inf2.el()]).own(|_| (inf1, inf2))]);
+        //. set_root(vec![hbox(vec![inf2.el()]).own(|_| (inf2))]);
     });
 }
