@@ -1,0 +1,68 @@
+:root {}
+
+* {
+    padding: 0;
+    margin: 0;
+    box-sizing: border-box;
+    pointer-events: none;
+    user-select: none;
+}
+
+/* # General leaves */
+/* # General structures */
+.hbox {
+    display: flex;
+    flex-direction: row;
+    flex-grow: 1;
+    justify-content: stretch;
+    max-height: 100%;
+    /*! max-width: 100%; */
+}
+
+.vbox {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    justify-content: stretch;
+    max-width: 100%;
+}
+
+.stack {
+    display: grid;
+    grid-template-rows: 1fr;
+    max-height: 100%;
+    max-width: 100%;
+}
+
+.stack>* {
+    grid-row: 1;
+    grid-column: 1;
+}
+
+/* # Specific containers + leaves */
+html {}
+
+html,
+body {
+    height: 100%;
+    width: 100%;
+    overflow-y: hidden;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.infinite_frame {
+    flex-grow: 1;
+    overflow-y: scroll;
+    max-height: 100%;
+    pointer-events: initial;
+}
+
+.infinite_content {
+    position: relative;
+}
+
+.infinite_content>* {
+    position: absolute;
+}
