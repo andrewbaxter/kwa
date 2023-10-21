@@ -132,7 +132,8 @@ struct Infiniscroll_<Id: Clone> {
     frame: El,
     content: El,
     /// Mirrors content's height, used to avoid js round trips (keep in sync)
-    content_height: f64,
+    logical_content_height: f64,
+    logical_scroll_top: f64,
     center_spinner: El,
     early_spinner: El,
     late_spinner: El,
@@ -163,8 +164,7 @@ impl<Id: Clone> Infiniscroll_<Id> {
             self.anchor_offset = 0.;
         } else {
             let content_origin_y =
-                self.content.raw().scroll_top() as f64 +
-                    self.frame.raw().client_height() as f64 * self.anchor_alignment;
+                self.logical_scroll_top as f64 + self.frame.raw().client_height() as f64 * self.anchor_alignment;
             while let Some(e_state) = self.real.get(self.anchor_i + 1) {
                 if content_origin_y < e_state.top {
                     break;
@@ -192,45 +192,45 @@ impl<Id: Clone> Infiniscroll_<Id> {
         logd!("Reanchor {} {} to {} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
     }
 
-    fn transition_alignment(&mut self) {
-        if self.real.is_empty() {
-            return;
-        }
+    fn transition_alignment(&mut self) -> bool {
         let old_anchor_alignment = self.anchor_alignment;
-        let mut early_all_end = true;
-        let mut late_all_end = true;
-        for f in self.feeds.values() {
-            early_all_end = early_all_end && f.early_stop && f.early_reserve.is_empty();
-            late_all_end = late_all_end && f.late_stop && f.late_reserve.is_empty();
-        }
-        logd!("set stops, early end {}, late end {}", early_all_end, late_all_end);
-        let scroll_top = self.content.raw().scroll_top() as f64;
-        if late_all_end && scroll_top + self.frame.raw().client_height() as f64 >= self.real.last().unwrap().top {
-            self.anchor_alignment = 1.;
-            logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
-            if self.anchor_alignment != old_anchor_alignment {
-                self.anchor_i = self.real.len() - 1;
-                self.reanchor();
+        if !self.real.is_empty() {
+            let mut early_all_end = true;
+            let mut late_all_end = true;
+            for f in self.feeds.values() {
+                early_all_end = early_all_end && f.early_stop && f.early_reserve.is_empty();
+                late_all_end = late_all_end && f.late_stop && f.late_reserve.is_empty();
             }
-            return;
-        }
-        if early_all_end && scroll_top <= {
-            let first = self.real.first().unwrap();
-            first.top + first.height
-        } {
-            self.anchor_alignment = 0.;
-            logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
-            if self.anchor_alignment != old_anchor_alignment {
-                self.anchor_i = 0;
-                self.reanchor();
+            logd!("set stops, early end {}, late end {}", early_all_end, late_all_end);
+            if late_all_end &&
+                self.logical_scroll_top + self.frame.raw().client_height() as f64 >= self.real.last().unwrap().top {
+                self.anchor_alignment = 1.;
+                logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
+                if self.anchor_alignment != old_anchor_alignment {
+                    self.anchor_i = self.real.len() - 1;
+                    return true;
+                }
+                return false;
             }
-            return;
+            if early_all_end && self.logical_scroll_top <= {
+                let first = self.real.first().unwrap();
+                first.top + first.height
+            } {
+                self.anchor_alignment = 0.;
+                logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
+                if self.anchor_alignment != old_anchor_alignment {
+                    self.anchor_i = 0;
+                    return true;
+                }
+                return false;
+            }
         }
         self.anchor_alignment = 0.5;
         logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
         if self.anchor_alignment != old_anchor_alignment {
-            self.reanchor();
+            return true;
         }
+        return false;
     }
 }
 
@@ -312,7 +312,8 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             reset_time: origin,
             frame: frame.clone(),
             content: content.clone(),
-            content_height: 0.,
+            logical_content_height: 0.,
+            logical_scroll_top: 0.,
             center_spinner: center_spinner,
             early_spinner: early_spinner,
             late_spinner: late_spinner,
@@ -370,6 +371,8 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                     if state1.mute_scroll >= Utc::now() {
                         return;
                     }
+                    state1.logical_scroll_top = state1.frame.raw().scroll_top() as f64;
+                    state1.transition_alignment();
                     state1.reanchor();
                 }
                 state.shake();
@@ -467,9 +470,11 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             let mut use_feed = None;
             for (feed_id, f_state) in &self1.feeds {
                 let Some(entry) = f_state.early_reserve.front() else {
+                    // Reserve empty
                     if f_state.early_stop {
                         continue;
                     } else {
+                        // Pending more
                         early_stop_all = false;
                         break 'realize_early;
                     }
@@ -505,9 +510,11 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             let mut use_feed = None;
             for (feed_id, f_state) in &self1.feeds {
                 let Some(entry) = f_state.late_reserve.front() else {
+                    // Reserve empty
                     if f_state.late_stop {
                         continue;
                     } else {
+                        // Pending more
                         late_stop_all = false;
                         break 'realize_late;
                     }
@@ -570,9 +577,9 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
 
         // # Do deferred updates: request more height
         let new_height = want_early + want_late;
-        if (new_height - self1.content_height).abs() >= 1. {
-            logd!("requesting height {} -> {}", self1.content_height, new_height);
-            self1.content_height = new_height;
+        if (new_height - self1.logical_content_height).abs() >= 1. {
+            logd!("requesting height {} -> {}", self1.logical_content_height, new_height);
+            self1.logical_content_height = new_height;
             self1
                 .content
                 .raw()
@@ -583,7 +590,13 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 .unwrap_throw();
         }
 
-        // # Do immediate updates based on logical values: place elements, manage reserve
+        // # Do immediate updates based on logical values
+        //
+        // * Place elements
+        //
+        // * Manage reserve
+        //
+        // * Unset stop status if reserve is discarded
         if !self1.real.is_empty() {
             let mut return_early = 0usize;
             let mut return_late = 0usize;
@@ -592,8 +605,8 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             {
                 let anchor = &mut self1.real[self1.anchor_i];
                 let anchor_height = anchor.height;
-                anchor.set_top(want_early + self1.anchor_offset);
                 edge_off_early = anchor_height * self1.anchor_alignment - self1.anchor_offset;
+                anchor.set_top(want_early - edge_off_early);
                 edge_off_late = anchor_height * (1. - self1.anchor_alignment) + self1.anchor_offset;
             }
             for e_state in self1.real[..self1.anchor_i].iter_mut().rev() {
@@ -639,18 +652,16 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 return_early,
                 return_late
             );
-            for e_state in self1.real.splice(0 .. return_early, vec![]).rev().collect::<Vec<EntryState<Id>>>() {
+            for e_state in self1.real.splice(0 .. return_early, vec![]) {
                 e_state.entry_el.ref_remove();
                 self1.feeds.get_mut(&e_state.feed_id).unwrap().early_reserve.push_front(e_state.entry);
             }
             let entries_len = self1.real.len();
-            for e_state in self1
-                .real
-                .splice(entries_len - return_late .. entries_len, vec![])
-                .collect::<Vec<EntryState<Id>>>() {
+            for e_state in self1.real.splice(entries_len - return_late .. entries_len, vec![]).rev() {
                 e_state.entry_el.ref_remove();
                 self1.feeds.get_mut(&e_state.feed_id).unwrap().late_reserve.push_front(e_state.entry);
             }
+            self1.anchor_i -= return_early;
         }
         let mut requesting_early = false;
         let mut requesting_late = false;
@@ -660,14 +671,20 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                 requesting_early = true;
                 requesting_late = true;
             } else {
-                f_state.early_reserve.truncate(MAX_RESERVE);
+                if f_state.early_reserve.len() > MAX_RESERVE {
+                    f_state.early_reserve.truncate(MAX_RESERVE);
+                    f_state.early_stop = false;
+                }
                 if !f_state.early_stop && f_state.early_reserve.len() < MIN_RESERVE {
                     let pivot = get_pivot_early(&self1.real, *feed_id, f_state).unwrap();
                     logd!("request early (pivot {:?})", pivot);
                     f_state.feed.request_before(pivot, REQUEST_COUNT);
                     requesting_early = true;
                 }
-                f_state.late_reserve.truncate(MAX_RESERVE);
+                if f_state.late_reserve.len() > MAX_RESERVE {
+                    f_state.late_reserve.truncate(MAX_RESERVE);
+                    f_state.late_stop = false;
+                }
                 if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
                     let pivot = get_pivot_late(&self1.real, *feed_id, f_state).unwrap();
                     logd!("request late (pivot {:?})", pivot);
@@ -681,16 +698,29 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !self1.real.is_empty() && requesting_late)]);
 
         // # Do immediate updates based on logical values: reset scroll (may fail)
-        let new_scroll_top = (want_early - frame_height * self1.anchor_alignment).max(0.);
-        logd!("reset scroll to {} - {} / {}", new_scroll_top, new_scroll_top + frame_height, self1.content_height);
-        self1.content.raw().set_scroll_top(new_scroll_top as i32);
+        self1.logical_scroll_top = (want_early - frame_height * self1.anchor_alignment).max(0.);
+        logd!(
+            "reset scroll to {} - {} / {}",
+            self1.logical_scroll_top,
+            self1.logical_scroll_top + frame_height,
+            self1.logical_content_height
+        );
+        self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
         logd!("==============");
     }
 
     fn shake(&self) {
         let mute_scroll = self.0.borrow().mute_scroll >= Utc::now();
         if mute_scroll {
-            self.shake_immediate();
+            self.0.borrow_mut().delay_update = Some(Timeout::new(0, {
+                let state = self.weak();
+                move || {
+                    let Some(state) = state.upgrade() else {
+                        return;
+                    };
+                    state.shake_immediate();
+                }
+            }));
         } else {
             self.0.borrow_mut().delay_update = Some(Timeout::new(200, {
                 let state = self.weak();
@@ -743,7 +773,9 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             feed.late_reserve.extend(postpend);
             feed.early_stop = early_stop;
             feed.late_stop = late_stop;
-            self1.transition_alignment();
+            if self1.transition_alignment() {
+                self1.reanchor();
+            }
         }
         self.shake();
     }
@@ -773,7 +805,9 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             );
             feed.early_reserve.extend(entries);
             feed.early_stop = stop;
-            self1.transition_alignment();
+            if self1.transition_alignment() {
+                self1.reanchor();
+            }
         }
         self.shake();
     }
@@ -803,7 +837,9 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
             );
             feed.late_reserve.extend(entries);
             feed.late_stop = stop;
-            self1.transition_alignment();
+            if self1.transition_alignment() {
+                self1.reanchor();
+            }
         }
         self.shake();
     }

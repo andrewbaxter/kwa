@@ -61,6 +61,7 @@ body {
 
 .infinite_content {
     position: relative;
+    overflow: hidden;
 }
 
 .infinite_content>* {
