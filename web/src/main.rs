@@ -56,7 +56,7 @@ fn main() {
 
         struct DemoFeedShared {
             parent: Option<(WeakInfiniscroll<i32>, FeedId)>,
-            at: i32,
+            stop: i32,
         }
 
         struct DemoFeed {
@@ -68,7 +68,7 @@ fn main() {
             fn new(initial_count: i32, generate_interval: Option<u32>) -> Self {
                 let shared = Rc::new(RefCell::new(DemoFeedShared {
                     parent: None,
-                    at: initial_count,
+                    stop: initial_count,
                 }));
                 return DemoFeed {
                     shared: shared.clone(),
@@ -87,9 +87,9 @@ fn main() {
                                 return;
                             };
                             let count = (random() * 2.) as i32 + 1;
-                            let first = shared.at;
-                            shared.at += count;
-                            for i in first .. first + count {
+                            let early = shared.stop;
+                            shared.stop += count;
+                            for i in early .. early + count {
                                 parent.add_entry_after_stop(*id_in_parent, Box::new(DemoEntry(i)));
                             }
                         }
@@ -108,7 +108,7 @@ fn main() {
                 let (parent, id_in_parent) = self1.parent.as_ref().unwrap();
                 let parent = parent.upgrade().unwrap();
                 let id_in_parent = *id_in_parent;
-                let at = self1.at;
+                let stop = self1.stop;
                 let count = count as i32;
                 let early_stop;
                 let early;
@@ -121,8 +121,8 @@ fn main() {
                 }
                 let late_stop;
                 let late;
-                if pivot + count >= at {
-                    late = at;
+                if pivot + count >= stop {
+                    late = stop;
                     late_stop = true;
                 } else {
                     late = pivot + count;
@@ -132,7 +132,7 @@ fn main() {
                     parent.add_entries_around_initial(
                         id_in_parent,
                         pivot,
-                        (early ..= late).map(DemoEntry::new).collect(),
+                        (early .. late).map(DemoEntry::new).collect(),
                         early_stop,
                         late_stop,
                     );
@@ -169,33 +169,30 @@ fn main() {
                 let (parent, id_in_parent) = self1.parent.as_ref().unwrap();
                 let parent = parent.upgrade().unwrap();
                 let id_in_parent = *id_in_parent;
-                let at = self1.at;
+                let stop = self1.stop;
                 let count = count as i32;
                 let late_stop;
                 let late;
-                if pivot + count >= at {
-                    late = at;
+                let early = pivot + 1;
+                if early + count >= stop {
+                    late = stop;
                     late_stop = true;
                 } else {
-                    late = pivot + count;
+                    late = early + count;
                     late_stop = false;
                 }
                 spawn_local(async move {
                     parent.add_entries_after_nostop(
                         id_in_parent,
                         pivot,
-                        (pivot + 1 ..= late).map(DemoEntry::new).collect(),
+                        (early .. late).map(DemoEntry::new).collect(),
                         late_stop,
                     );
                 });
             }
         }
 
-        let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(
-            1000,
-            None,
-            //.     Some(5000),
-        ))]);
+        let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, Some(5000)))]);
 
         //. let inf2 = Infiniscroll::new(0, vec![Box::new(DemoFeed::new(100, None))]);
         set_root(vec![hbox(vec![inf1.el()]).own(|_| (inf1))]);

@@ -544,7 +544,11 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
 
         // Apply changes
         let dbg_anchor_i = self1.anchor_i;
-        self1.anchor_i += prepend_entries.len();
+        if self1.real.is_empty() {
+            self1.anchor_i += prepend_entries.len() - 1;
+        } else {
+            self1.anchor_i += prepend_entries.len();
+        }
         logd!("prepend; anchor i {} -> {}", dbg_anchor_i, self1.anchor_i);
         self1
             .content
@@ -788,6 +792,17 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         entries: Vec<Box<dyn Entry<Id>>>,
         stop: bool,
     ) {
+        assert!(bb!{
+            'assert _;
+            let mut at = initial_pivot.clone();
+            for e in &entries {
+                if e.time() >= at {
+                    break 'assert false;
+                }
+                at = e.time();
+            }
+            true
+        });
         {
             let mut self1 = self.0.borrow_mut();
             let Some(current_pivot) = get_pivot_early(&self1.real, feed_id, self1.feeds.get(&feed_id).unwrap()) else {
@@ -820,6 +835,17 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
         entries: Vec<Box<dyn Entry<Id>>>,
         stop: bool,
     ) {
+        assert!(bb!{
+            'assert _;
+            let mut at = initial_pivot.clone();
+            for e in &entries {
+                if e.time() <= at {
+                    break 'assert false;
+                }
+                at = e.time();
+            }
+            true
+        });
         {
             let mut self1 = self.0.borrow_mut();
             let Some(current_pivot) = get_pivot_late(&self1.real, feed_id, self1.feeds.get(&feed_id).unwrap()) else {
@@ -853,21 +879,18 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                     'find_insert _;
                     for (i, real_state) in self1.real.iter().enumerate().rev() {
                         if real_state.entry.time() < time {
-                            break 'find_insert i;
+                            break 'find_insert Some(i);
                         }
                     }
-                    break 0;
+                    break None;
                 };
-                if insert_after_i == 0 {
-                    let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                    feed.early_reserve.push_front(entry);
-                } else {
+                if let Some(insert_after_i) = insert_after_i {
                     let anchor_last = self1.real.is_empty() || self1.anchor_i == self1.real.len() - 1;
-                    let insert_at_end = insert_after_i == self1.real.len();
+                    let insert_at_end = insert_after_i + 1 == self1.real.len();
                     let real =
                         realize_entry(&self1.content, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
                     self1.content.ref_push(real.entry_el.clone());
-                    self1.real.insert(insert_after_i, real);
+                    self1.real.insert(insert_after_i + 1, real);
                     if anchor_last {
                         if insert_at_end {
                             self1.anchor_i = self1.real.len() - 1;
@@ -875,11 +898,14 @@ impl<Id: std::fmt::Debug + Clone + PartialOrd + 'static> Infiniscroll<Id> {
                             self1.anchor_offset = 0.;
                         }
                     } else {
-                        if insert_after_i <= self1.anchor_i {
+                        if insert_after_i < self1.anchor_i {
                             self1.anchor_i += 1;
                             logd!("realtime, insert before; anchor_i {}", self1.anchor_i);
                         }
                     }
+                } else {
+                    let feed = self1.feeds.get_mut(&feed_id).unwrap();
+                    feed.early_reserve.push_front(entry);
                 }
             } else {
                 let feed = self1.feeds.get_mut(&feed_id).unwrap();
