@@ -17,20 +17,16 @@ use rooting::{
     El,
 };
 use wasm_bindgen_futures::spawn_local;
-use crate::{
+use web::{
     infiniscroll::{
         Entry,
+        FeedId,
         WeakInfiniscroll,
         Feed,
         Infiniscroll,
-        FeedId,
     },
     html::hbox,
 };
-
-pub mod infiniscroll;
-pub mod html;
-pub mod util;
 
 fn main() {
     panic::set_hook(Box::new(console_error_panic_hook::hook));
@@ -194,7 +190,7 @@ fn main() {
 
         let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, Some(5000)))]);
         let inf2 = Infiniscroll::new(0, vec![Box::new(DemoFeed::new(10, None))]);
-        set_root(vec![hbox(vec![inf1.el(), inf2.el()]).own(|_| (inf1, inf2))]);
+        set_root(vec![hbox().extend(vec![inf1.el(), inf2.el()]).own(|_| (inf1, inf2))]);
         //. set_root(vec![hbox(vec![inf2.el()]).own(|_| (inf2))]);
     });
 }
