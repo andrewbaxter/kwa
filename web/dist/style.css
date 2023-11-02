@@ -39,32 +39,61 @@
     grid-column: 1;
 }
 
-/* # Specific containers + leaves */
-html {}
+.group {
+    display: content;
+}
 
+/* # Specific containers + leaves */
 html,
 body {
     height: 100%;
     width: 100%;
-    overflow-y: hidden;
-    overflow-x: hidden;
+    overflow-y: clip;
+    overflow-x: clip;
     display: flex;
     flex-direction: column;
 }
 
-.infinite_frame {
+.infinite {
     flex-grow: 1;
     overflow-y: scroll;
     scrollbar-width: none;
     max-height: 100%;
     pointer-events: initial;
+
+    & .content {
+        display: flex;
+        flex-direction: column;
+        position: relative;
+    }
+
+    & .content_layout {
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+
+        &>.sticky {
+            position: sticky;
+            top: 0px;
+            bottom: 0px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        &>.real {
+            display: flex;
+            flex-direction: column;
+
+            &>.sticky {
+                position: sticky;
+                top: 0px;
+                bottom: 0px;
+            }
+        }
+    }
 }
 
-.infinite_content {
-    position: relative;
-    overflow: hidden;
-}
-
-.infinite_content>* {
-    position: absolute;
+/* # Testing */
+.testing_entry {
+    pointer-events: auto;
 }
