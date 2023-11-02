@@ -166,6 +166,8 @@ struct FeedState<Id> {
 struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
     /// Used when new/resetting
     reset_time: Id,
+    early_padding: f64,
+    late_padding: f64,
     frame: El,
     cached_frame_height: f64,
     content: El,
@@ -448,6 +450,8 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         );
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
             reset_time: reset_id,
+            early_padding: 0.,
+            late_padding: 0.,
             frame: frame.clone(),
             cached_frame_height: 0.,
             content: content.clone(),
@@ -565,6 +569,16 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
 
     pub fn el(&self) -> El {
         return self.0.borrow().frame.clone();
+    }
+
+    pub fn set_padding_pre(&self, padding: f64) {
+        self.0.borrow_mut().early_padding = padding;
+        self.shake_immediate();
+    }
+
+    pub fn set_padding_post(&self, padding: f64) {
+        self.0.borrow_mut().late_padding = padding;
+        self.shake_immediate();
     }
 
     pub fn jump(&self, time: Id) {
@@ -944,7 +958,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // Distance from content-origin to start of content
         let want_early;
         if stop_all_early {
-            want_early = used_early.min(want_nostop_early);
+            want_early = (used_early + self1.early_padding).min(want_nostop_early);
         } else {
             want_early = want_nostop_early;
         }
@@ -952,7 +966,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // Distance from content-origin to end of content
         let want_late;
         if stop_all_late {
-            want_late = used_late.min(want_nostop_late);
+            want_late = (used_late + self1.late_padding).min(want_nostop_late);
         } else {
             want_late = want_nostop_late;
         }
