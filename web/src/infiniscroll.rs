@@ -213,46 +213,24 @@ struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
 }
 
 impl<Id: IdTraits> Infiniscroll_<Id> {
-    fn update_logical_scroll(&mut self, want_early: f64, want_late: f64) {
-        let lower = want_early;
-        let upper = self.logical_content_height - want_late - self.cached_frame_height;
-        self.logical_scroll_top = (lower + (upper - lower) * self.anchor_alignment).max(0.);
-        logd!(
-            "update logical scroll: {} - {} / {}; origin y is {}",
-            self.logical_scroll_top,
-            self.logical_scroll_top + self.cached_frame_height,
-            self.logical_content_height,
-            self.logical_scroll_top + self.cached_frame_height * self.anchor_alignment
-        );
-        if let Some(anchor_i) = &self.anchor_i {
-            logd!("update logical scroll: post anchor origin {}", {
-                let base_e_content_offset = self.logical_content_layout_offset + self.cached_real_offset;
-                let anchor = self.real.get(*anchor_i).unwrap();
-                base_e_content_offset + anchor.entry_el.offset_top() +
-                    anchor.entry_el.offset_height() * self.anchor_alignment -
-                    self.anchor_offset
-            });
-        }
-    }
-
-    fn reanchor_inner(&mut self, mut anchor_i: usize, content_origin_y: f64) {
+    fn reanchor_inner(&mut self, mut anchor_i: usize, real_origin_y: f64) {
         // Move anchor pointer down until directly after desired element
         while let Some(e_state) = self.real.get(anchor_i + 1) {
-            if e_state.entry_el.offset_top() > content_origin_y {
+            if e_state.entry_el.offset_top() > real_origin_y {
                 break;
             }
             logd!(
                 "move anchor_i +1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
-                content_origin_y
+                real_origin_y
             );
             anchor_i += 1;
         }
 
         // Move anchor pointer up until directly above (=at) desired element.
         while let Some(e_state) = self.real.get(anchor_i) {
-            if e_state.entry_el.offset_top() <= content_origin_y {
+            if e_state.entry_el.offset_top() <= real_origin_y {
                 break;
             }
             if anchor_i == 0 {
@@ -262,24 +240,20 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
                 "move anchor_i -1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
-                content_origin_y
+                real_origin_y
             );
             anchor_i -= 1;
         }
 
         // Calculate offset
         let anchor = self.real.get(anchor_i).unwrap();
-        let anchor_height = anchor.entry_el.offset_height();
-        let anchor_top = anchor.entry_el.offset_top();
-        let anchor_origin_y = anchor_top + anchor_height * self.anchor_alignment;
-        self.anchor_offset =
-            (anchor_origin_y -
-                content_origin_y).clamp(
-                -anchor_height + anchor_height * self.anchor_alignment,
-                anchor_height * self.anchor_alignment,
-            );
+        let anchor_origin_y = anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment;
+        self.anchor_offset = anchor_origin_y - real_origin_y;
 
         // .
+        for (i, r) in self.real.iter().enumerate() {
+            r.entry_el.ref_modify_classes(&[("debug_anchor", i == anchor_i)]);
+        }
         self.anchor_i = Some(anchor_i);
     }
 
@@ -287,12 +261,26 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
         let old_anchor_i = self.anchor_i;
         let old_anchor_offset = self.anchor_offset;
         if let Some(anchor_i) = self.anchor_i {
-            let content_origin_y = 
+            let real_origin_y = 
                 // Origin in content space
-                self.logical_scroll_top + self.cached_frame_height * self.anchor_alignment
+                self.logical_scroll_top + self.anchor_alignment.mix(self.early_padding, self.cached_frame_height - self.late_padding)
                 // Origin in content-layout space
                 - self.logical_content_layout_offset - self.cached_real_offset;
-            self.reanchor_inner(anchor_i, content_origin_y);
+            logd!(
+                "scroll reanchor: origin y {} + {}.mix({}, {} - {}) - {} - {} = {}",
+                self.logical_scroll_top,
+                self.anchor_alignment,
+                self.early_padding,
+                self.cached_frame_height,
+                self.late_padding,
+                self.logical_content_layout_offset,
+                self.cached_real_offset,
+                self.logical_scroll_top +
+                    self.anchor_alignment.mix(self.early_padding, self.cached_frame_height - self.late_padding) -
+                    self.logical_content_layout_offset -
+                    self.cached_real_offset
+            );
+            self.reanchor_inner(anchor_i, real_origin_y);
         } else {
             self.anchor_i = None;
             self.anchor_offset = 0.;
@@ -306,7 +294,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             return;
         };
         let anchor = self.real.get(anchor_i).unwrap();
-        let origin_y =
+        let real_origin_y =
             anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment -
                 self.anchor_offset;
         logd!(
@@ -317,55 +305,70 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             self.anchor_offset,
             anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment - self.anchor_offset
         );
-        let frame_early = origin_y - self.cached_frame_height * self.anchor_alignment;
-        let frame_late = origin_y + self.cached_frame_height * (1. - self.anchor_alignment);
+        let candidate_early_real_origin_y =
+            real_origin_y - self.cached_frame_height * self.anchor_alignment + self.early_padding;
+        let candidate_late_real_origin_y =
+            real_origin_y + self.cached_frame_height * (1. - self.anchor_alignment) - self.late_padding;
         let old_anchor_alignment = self.anchor_alignment;
-        let mut early_all_end = true;
-        let mut late_all_end = true;
+        let mut early_all_stop = true;
+        let mut late_all_stop = true;
         for f in self.feeds.values() {
-            early_all_end = early_all_end && f.early_stop && f.early_reserve.is_empty();
-            late_all_end = late_all_end && f.late_stop && f.late_reserve.is_empty();
+            early_all_stop = early_all_stop && f.early_stop && f.early_reserve.is_empty();
+            late_all_stop = late_all_stop && f.late_stop && f.late_reserve.is_empty();
         }
         let last_el = self.real.last().unwrap();
         let last_el_top = last_el.entry_el.offset_top();
         let first_el = self.real.first().unwrap();
         let first_el_bottom = first_el.entry_el.offset_height();
         logd!(
-            "anchor {} / {}; origin y {}; set stops, early end {}, late end {}; frame early {}, late {}; first el bottom {}; last el top {}",
+            "anchor {} / {}; origin y {}; set stops, early end {}, late end {}; candidate origin y early {}, late {}; first el bottom {}; last el top {}",
             anchor_i,
             self.real.len(),
-            origin_y,
-            early_all_end,
-            late_all_end,
-            frame_early,
-            frame_late,
+            real_origin_y,
+            early_all_stop,
+            late_all_stop,
+            candidate_early_real_origin_y,
+            candidate_late_real_origin_y,
             first_el_bottom,
             last_el_top
         );
+        for (i, r) in self.real.iter().enumerate() {
+            r
+                .entry_el
+                .ref_modify_classes(
+                    &[
+                        ("debug_c_early", r.entry_el.offset_top() <= candidate_early_real_origin_y),
+                        (
+                            "debug_c_late",
+                            r.entry_el.offset_top() + r.entry_el.offset_height() >= candidate_late_real_origin_y,
+                        ),
+                    ],
+                );
+        }
 
         // # Hovering late end, align to late end
-        if late_all_end && frame_late >= last_el_top {
+        if late_all_stop && candidate_late_real_origin_y >= last_el_top {
             self.anchor_alignment = 1.;
             logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
             self.anchor_i = Some(self.real.len() - 1);
-            self.anchor_offset = frame_late.min(last_el_top) - last_el_top;
+            self.anchor_offset = candidate_late_real_origin_y - last_el_top;
             return;
         }
 
         // # Hovering early end, align to early end
-        if early_all_end && frame_early <= first_el_bottom {
+        if early_all_stop && candidate_early_real_origin_y <= first_el_bottom {
             self.anchor_alignment = 0.;
             logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
             self.anchor_i = Some(0);
-            self.anchor_offset = frame_early.max(0.);
+            self.anchor_offset = candidate_early_real_origin_y;
             return;
         }
 
         // # Otherwise, revert to middle
         self.anchor_alignment = 0.5;
         logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
-        let new_origin_y = (frame_early + frame_late) / 2.;
-        self.reanchor_inner(anchor_i, new_origin_y);
+        let new_real_origin_y = (candidate_early_real_origin_y + candidate_late_real_origin_y) / 2.;
+        self.reanchor_inner(anchor_i, new_real_origin_y);
     }
 }
 
@@ -701,18 +704,18 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // # Calculate content + current theoretical used space
         let mut used_early = 0f64;
         let mut used_late = 0f64;
-        let mut origin_y = 0f64;
+        let mut real_origin_y = 0f64;
         if !self1.real.is_empty() {
             let real_height = self1.real.el().offset_height();
             let anchor_i = self1.anchor_i.unwrap();
             let anchor = &mut self1.real.get(anchor_i).unwrap();
             let anchor_top = anchor.entry_el.offset_top();
             let anchor_height = anchor.entry_el.offset_height();
-            origin_y = anchor_top + anchor_height * self1.anchor_alignment
+            real_origin_y = anchor_top + anchor_height * self1.anchor_alignment
                 // Shift up becomes early usage
                 - self1.anchor_offset;
-            used_early = origin_y;
-            used_late = real_height - origin_y;
+            used_early = real_origin_y;
+            used_late = real_height - real_origin_y;
         }
         logd!("shake imm, used early {}, late {}", used_early, used_late);
 
@@ -723,13 +726,13 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         let mut unrealize_early = 0usize;
         for e in &self1.real {
             let bottom = e.entry_el.offset_top() + e.entry_el.offset_height();
-            let min_dist = origin_y - bottom;
+            let min_dist = real_origin_y - bottom;
             if min_dist <= want_nostop_early {
                 break;
             }
             logd!("unrealize; bottom {} vs want early {}", min_dist, want_nostop_early);
             unrealize_early += 1;
-            used_early = origin_y - bottom;
+            used_early = real_origin_y - bottom;
         }
         let mut stop_all_early = true;
         let mut realized_early = vec![];
@@ -793,12 +796,12 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         let mut unrealize_late = 0usize;
         for e in self1.real.iter().rev() {
             let top = e.entry_el.offset_top();
-            let min_dist = top - origin_y;
+            let min_dist = top - real_origin_y;
             if min_dist <= want_nostop_late {
                 break;
             }
             unrealize_late += 1;
-            used_late = top - origin_y;
+            used_late = top - real_origin_y;
         }
         let mut stop_all_late = true;
         let mut realized_late = vec![];
@@ -905,13 +908,17 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         }
         self1.late_sticky.splice(0, 0, late_prepend_sticky);
         if let Some(anchor_i) = &self1.anchor_i {
-            logd!("anchor origin now {}", {
-                let base_e_content_offset = self1.logical_content_layout_offset + self1.cached_real_offset;
-                let anchor = self1.real.get(*anchor_i).unwrap();
-                base_e_content_offset + anchor.entry_el.offset_top() +
-                    anchor.entry_el.offset_height() * self1.anchor_alignment -
+            let anchor = self1.real.get(*anchor_i).unwrap();
+            logd!(
+                "anchor origin now (content layout) i {}, {} + {} * {} - {} = {}",
+                anchor_i,
+                anchor.entry_el.offset_top(),
+                anchor.entry_el.offset_height(),
+                self1.anchor_alignment,
+                self1.anchor_offset,
+                anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self1.anchor_alignment -
                     self1.anchor_offset
-            });
+            );
         }
 
         // # Prune reserve and unset stop status
@@ -997,11 +1004,11 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         self1.logical_content_layout_offset = self1.anchor_alignment.mix(
             // Start of content is origin (want_early) minus the amount used before
             // (used_early)
-            want_early - used_early - self1.cached_real_offset,
+            want_early - used_early,
             // Backwards from end of content, in case used < frame height.
             // `logical_content_height` is padded, so this will push it to the end.
-            self1.logical_content_height - want_late - used_early - self1.cached_real_offset,
-        );
+            self1.logical_content_height - (want_late + used_early),
+        ) - self1.cached_real_offset;
         logd!(
             "content layout top: mix by {} ({} - {} - {} = {}, {} - {} - {} - {} = {}) = {}",
             self1.anchor_alignment,
@@ -1025,10 +1032,47 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             .set_property("top", &format!("{}px", self1.logical_content_layout_offset))
             .unwrap();
 
-        // # Calculate centered logical scroll
-        self1.update_logical_scroll(want_early, want_late);
-
-        // # Set scroll (may fail, gets fixed after resize)
+        // # Calculate centered scroll so visual origin matches content origin
+        self1.logical_scroll_top =
+            self1
+                .anchor_alignment
+                .mix(
+                    want_early - self1.early_padding,
+                    self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
+                )
+                .max(0.);
+        logd!(
+            "update logical scroll: {} - {} / {} from {}.mix({} - {} = {}, {} - ({} - {} = {}) - {} = {}) = {}; cl origin y is {}",
+            // range
+            self1.logical_scroll_top,
+            self1.logical_scroll_top + self1.cached_frame_height,
+            self1.logical_content_height,
+            // mix 0
+            self1.anchor_alignment,
+            // mix 1
+            want_early,
+            self1.early_padding,
+            want_early - self1.early_padding,
+            // mix 2
+            self1.logical_content_height,
+            want_late,
+            self1.late_padding,
+            (want_late - self1.late_padding),
+            self1.cached_frame_height,
+            self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
+            // mix =
+            self1
+                .anchor_alignment
+                .mix(
+                    want_early - self1.early_padding,
+                    self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
+                ),
+            // origin
+            self1.logical_scroll_top +
+                self1.anchor_alignment.mix(self1.early_padding, self1.cached_frame_height - self1.late_padding) -
+                self1.logical_content_layout_offset -
+                self1.cached_real_offset
+        );
         self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
         self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
         logd!("==============");

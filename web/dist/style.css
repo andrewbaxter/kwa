@@ -97,3 +97,12 @@ body {
 .testing_entry {
     pointer-events: auto;
 }
+
+.debug_anchor {
+    color: purple;
+}
+
+.debug_c_early,
+.debug_c_late {
+    opacity: 0.4;
+}
