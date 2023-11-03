@@ -60,6 +60,7 @@ body {
     scrollbar-width: none;
     max-height: 100%;
     pointer-events: initial;
+    transition: padding-top 0.2s ease-out, padding-bottom 0.2s ease-out;
 
     & .content {
         display: flex;
@@ -96,13 +97,4 @@ body {
 /* # Testing */
 .testing_entry {
     pointer-events: auto;
-}
-
-.debug_anchor {
-    color: purple;
-}
-
-.debug_c_early,
-.debug_c_late {
-    opacity: 0.4;
 }

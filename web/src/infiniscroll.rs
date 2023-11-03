@@ -80,11 +80,12 @@ use wasm_bindgen::{
 use web_sys::HtmlElement;
 use crate::{
     bb,
-    logd,
+    logn,
     html::{
         stack,
     },
     util::MoreMath,
+    logd,
 };
 
 const PX_PER_CM: f64 = 96. / 2.54;
@@ -166,8 +167,6 @@ struct FeedState<Id> {
 struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
     /// Used when new/resetting
     reset_time: Id,
-    early_padding: f64,
-    late_padding: f64,
     frame: El,
     cached_frame_height: f64,
     content: El,
@@ -204,12 +203,30 @@ struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
     /// `-height..0` because if the element is below the origin the anchor would
     /// actually be the previous element. If alignment is 1, has range `0..height`.
     anchor_offset: f64,
-    delay_update: Option<Timeout>,
-    delay_update_last: DateTime<Utc>,
+    shake_future: Option<Timeout>,
     entry_resize_observer: Option<ResizeObserver>,
-    // Ignore scroll events until this time, because they're probably relayout
-    // generated and not human
+    // After making content layout changes, the next scroll event will be synthetic
+    // (not human-volitional), so ignore it for anchor modification.
     mute_scroll: DateTime<Utc>,
+    // After human-volitional scrolling, more scrolling may soon come so push back
+    // shake for this number of ms.
+    delay_shake: u32,
+}
+
+fn calc_anchor_offset(real_origin_y: f64, anchor_top: f64, anchor_height: f64, anchor_alignment: f64) -> f64 {
+    let anchor_origin_y = anchor_top + anchor_height * anchor_alignment;
+    let anchor_offset =
+        (anchor_origin_y - real_origin_y).clamp(-anchor_height * anchor_alignment, anchor_height * anchor_alignment);
+    logn!(
+        "new anchor origin offset {} + {} * {} = {}, - {} = {}",
+        anchor_top,
+        anchor_height,
+        anchor_alignment,
+        anchor_top + anchor_height * anchor_alignment,
+        real_origin_y,
+        anchor_offset
+    );
+    return anchor_offset;
 }
 
 impl<Id: IdTraits> Infiniscroll_<Id> {
@@ -219,7 +236,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             if e_state.entry_el.offset_top() > real_origin_y {
                 break;
             }
-            logd!(
+            logn!(
                 "move anchor_i +1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
@@ -236,7 +253,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             if anchor_i == 0 {
                 break;
             }
-            logd!(
+            logn!(
                 "move anchor_i -1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
@@ -247,13 +264,15 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
 
         // Calculate offset
         let anchor = self.real.get(anchor_i).unwrap();
-        let anchor_origin_y = anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment;
-        self.anchor_offset = anchor_origin_y - real_origin_y;
+        self.anchor_offset =
+            calc_anchor_offset(
+                real_origin_y,
+                anchor.entry_el.offset_top(),
+                anchor.entry_el.offset_height(),
+                self.anchor_alignment,
+            );
 
         // .
-        for (i, r) in self.real.iter().enumerate() {
-            r.entry_el.ref_modify_classes(&[("debug_anchor", i == anchor_i)]);
-        }
         self.anchor_i = Some(anchor_i);
     }
 
@@ -263,20 +282,18 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
         if let Some(anchor_i) = self.anchor_i {
             let real_origin_y = 
                 // Origin in content space
-                self.logical_scroll_top + self.anchor_alignment.mix(self.early_padding, self.cached_frame_height - self.late_padding)
+                self.logical_scroll_top + self.anchor_alignment.mix(0., self.cached_frame_height)
                 // Origin in content-layout space
                 - self.logical_content_layout_offset - self.cached_real_offset;
-            logd!(
-                "scroll reanchor: origin y {} + {}.mix({}, {} - {}) - {} - {} = {}",
+            logn!(
+                "scroll reanchor: origin y {} + {}.mix({}, {}) - {} - {} = {}",
                 self.logical_scroll_top,
                 self.anchor_alignment,
-                self.early_padding,
+                0.,
                 self.cached_frame_height,
-                self.late_padding,
                 self.logical_content_layout_offset,
                 self.cached_real_offset,
-                self.logical_scroll_top +
-                    self.anchor_alignment.mix(self.early_padding, self.cached_frame_height - self.late_padding) -
+                self.logical_scroll_top + self.anchor_alignment.mix(0., self.cached_frame_height - 0.) -
                     self.logical_content_layout_offset -
                     self.cached_real_offset
             );
@@ -285,7 +302,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             self.anchor_i = None;
             self.anchor_offset = 0.;
         }
-        logd!("Reanchor {:?} {} to {:?} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
+        logn!("Reanchor {:?} {} to {:?} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
     }
 
     // Change anchor based on logical values (anchor, alignment), + frame height
@@ -297,7 +314,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
         let real_origin_y =
             anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment -
                 self.anchor_offset;
-        logd!(
+        logn!(
             "transition: origin y = {} + {} * {} - {} = {}",
             anchor.entry_el.offset_top(),
             anchor.entry_el.offset_height(),
@@ -305,10 +322,8 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             self.anchor_offset,
             anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self.anchor_alignment - self.anchor_offset
         );
-        let candidate_early_real_origin_y =
-            real_origin_y - self.cached_frame_height * self.anchor_alignment + self.early_padding;
-        let candidate_late_real_origin_y =
-            real_origin_y + self.cached_frame_height * (1. - self.anchor_alignment) - self.late_padding;
+        let candidate_early_real_origin_y = real_origin_y - self.cached_frame_height * self.anchor_alignment;
+        let candidate_late_real_origin_y = real_origin_y + self.cached_frame_height * (1. - self.anchor_alignment);
         let old_anchor_alignment = self.anchor_alignment;
         let mut early_all_stop = true;
         let mut late_all_stop = true;
@@ -319,8 +334,10 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
         let last_el = self.real.last().unwrap();
         let last_el_top = last_el.entry_el.offset_top();
         let first_el = self.real.first().unwrap();
-        let first_el_bottom = first_el.entry_el.offset_height();
-        logd!(
+        let first_el_top = 0.;
+        let first_el_height = first_el.entry_el.offset_height();
+        let first_el_bottom = first_el_top + first_el_height;
+        logn!(
             "anchor {} / {}; origin y {}; set stops, early end {}, late end {}; candidate origin y early {}, late {}; first el bottom {}; last el top {}",
             anchor_i,
             self.real.len(),
@@ -332,41 +349,40 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             first_el_bottom,
             last_el_top
         );
-        for (i, r) in self.real.iter().enumerate() {
-            r
-                .entry_el
-                .ref_modify_classes(
-                    &[
-                        ("debug_c_early", r.entry_el.offset_top() <= candidate_early_real_origin_y),
-                        (
-                            "debug_c_late",
-                            r.entry_el.offset_top() + r.entry_el.offset_height() >= candidate_late_real_origin_y,
-                        ),
-                    ],
-                );
-        }
 
         // # Hovering late end, align to late end
         if late_all_stop && candidate_late_real_origin_y >= last_el_top {
             self.anchor_alignment = 1.;
-            logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
+            logn!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
             self.anchor_i = Some(self.real.len() - 1);
-            self.anchor_offset = candidate_late_real_origin_y - last_el_top;
+            self.anchor_offset =
+                calc_anchor_offset(
+                    candidate_late_real_origin_y,
+                    last_el_top,
+                    last_el.entry_el.offset_height(),
+                    self.anchor_alignment,
+                );
             return;
         }
 
         // # Hovering early end, align to early end
         if early_all_stop && candidate_early_real_origin_y <= first_el_bottom {
             self.anchor_alignment = 0.;
-            logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
+            logn!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
             self.anchor_i = Some(0);
-            self.anchor_offset = candidate_early_real_origin_y;
+            self.anchor_offset =
+                calc_anchor_offset(
+                    candidate_early_real_origin_y,
+                    first_el_top,
+                    first_el_height,
+                    self.anchor_alignment,
+                );
             return;
         }
 
         // # Otherwise, revert to middle
         self.anchor_alignment = 0.5;
-        logd!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
+        logn!("Set alignment {} -> {}", old_anchor_alignment, self.anchor_alignment);
         let new_real_origin_y = (candidate_early_real_origin_y + candidate_late_real_origin_y) / 2.;
         self.reanchor_inner(anchor_i, new_real_origin_y);
     }
@@ -453,8 +469,6 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         );
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
             reset_time: reset_id,
-            early_padding: 0.,
-            late_padding: 0.,
             frame: frame.clone(),
             cached_frame_height: 0.,
             content: content.clone(),
@@ -474,15 +488,15 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             anchor_i: None,
             anchor_alignment: 0.5,
             anchor_offset: 0.,
-            delay_update: None,
-            delay_update_last: DateTime::<Utc>::MIN_UTC,
+            shake_future: None,
             entry_resize_observer: None,
             mute_scroll: Utc::now() + Duration::milliseconds(300),
+            delay_shake: 0,
         })));
         let entry_resize_observer = Some(ResizeObserver::new({
             let state = state.weak();
             move |_| {
-                logd!("resize cb on real");
+                logn!("resize cb on real");
                 let Some(state) = state.upgrade() else {
                     return;
                 };
@@ -520,8 +534,10 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     state1.logical_scroll_top = state1.frame.raw().scroll_top() as f64;
                     state1.scroll_reanchor();
                     state1.transition_alignment_reanchor();
+                    state1.delay_shake = 200;
                 }
                 state.shake();
+                logd!("EV scroll done");
             }
         });
         frame.ref_on_resize({
@@ -541,6 +557,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     state1.mute_scroll = Utc::now() + Duration::milliseconds(50);
                 }
                 state.shake();
+                logd!("EV frame resize done");
             }
         });
         content.ref_on_resize({
@@ -557,9 +574,15 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
                 let mut self1 = state.0.borrow_mut();
                 old_content_height.set(content_height);
-                logd!("reset scroll to {} - ? / {}", self1.logical_scroll_top, self1.logical_content_height);
+                logn!(
+                    "reset scroll to {} - {} / {}",
+                    self1.logical_scroll_top,
+                    self1.logical_scroll_top + self1.cached_frame_height,
+                    self1.logical_content_height
+                );
                 self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
                 self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
+                logd!("EV content resize done");
             }
         });
         state.shake_immediate();
@@ -575,13 +598,29 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     }
 
     pub fn set_padding_pre(&self, padding: f64) {
-        self.0.borrow_mut().early_padding = padding;
-        self.shake_immediate();
+        self
+            .0
+            .borrow()
+            .frame
+            .raw()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .style()
+            .set_property("padding-top", &format!("{}px", padding))
+            .unwrap();
     }
 
     pub fn set_padding_post(&self, padding: f64) {
-        self.0.borrow_mut().late_padding = padding;
-        self.shake_immediate();
+        self
+            .0
+            .borrow()
+            .frame
+            .raw()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .style()
+            .set_property("padding-bottom", &format!("{}px", padding))
+            .unwrap();
     }
 
     pub fn jump(&self, time: Id) {
@@ -698,8 +737,8 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         logd!("shake immediate ------------");
         let mut self1 = self.0.borrow_mut();
         let self1 = &mut *self1;
-        self1.delay_update_last = Utc::now();
-        self1.delay_update = None;
+        self1.delay_shake = 0;
+        self1.shake_future = None;
 
         // # Calculate content + current theoretical used space
         let mut used_early = 0f64;
@@ -717,7 +756,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             used_early = real_origin_y;
             used_late = real_height - real_origin_y;
         }
-        logd!("shake imm, used early {}, late {}", used_early, used_late);
+        logn!("shake imm, used early {}, late {}", used_early, used_late);
 
         // # Realize and unrealize elements to match goal bounds
         //
@@ -730,7 +769,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             if min_dist <= want_nostop_early {
                 break;
             }
-            logd!("unrealize; bottom {} vs want early {}", min_dist, want_nostop_early);
+            logn!("unrealize; bottom {} vs want early {}", min_dist, want_nostop_early);
             unrealize_early += 1;
             used_early = real_origin_y - bottom;
         }
@@ -785,7 +824,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 let height = real.entry_el.offset_height();
                 real.entry_el.ref_remove();
                 used_early += height;
-                logd!("realize pre; id {:?}; height {} -> {}", real.entry.time(), height, used_early);
+                logn!("realize pre; id {:?}; height {} -> {}", real.entry.time(), height, used_early);
                 realized_early.push(real);
             }
             stop_all_early = false;
@@ -854,7 +893,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 let height = real.entry_el.offset_height();
                 real.entry_el.ref_remove();
                 used_late += height;
-                logd!("realize post; id {:?}; height {} -> {}", real.entry.time(), height, used_late);
+                logn!("realize post; id {:?}; height {} -> {}", real.entry.time(), height, used_late);
                 realized_late.push(real);
             }
             stop_all_late = false;
@@ -865,7 +904,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // ### Update anchor
         match self1.anchor_i {
             Some(anchor_i) => {
-                logd!("prepend; shift anchor {} +{} -{}", anchor_i, realized_early.len(), unrealize_early);
+                logn!("prepend; shift anchor {} +{} -{}", anchor_i, realized_early.len(), unrealize_early);
                 self1.anchor_i = Some(anchor_i + realized_early.len() - unrealize_early);
             },
             None => {
@@ -874,11 +913,11 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                         // nop
                     },
                     (true, false) => {
-                        logd!("prepend; reset anchor i -> {:?} (first)", realized_early.len());
+                        logn!("prepend; reset anchor i -> {:?} (first)", realized_early.len());
                         self1.anchor_i = Some(0);
                     },
                     (false, _) => {
-                        logd!("prepend; reset anchor i -> {:?} (last)", realized_early.len() - 1);
+                        logn!("prepend; reset anchor i -> {:?} (last)", realized_early.len() - 1);
                         self1.anchor_i = Some(realized_early.len() - 1);
                     },
                 }
@@ -909,7 +948,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         self1.late_sticky.splice(0, 0, late_prepend_sticky);
         if let Some(anchor_i) = &self1.anchor_i {
             let anchor = self1.real.get(*anchor_i).unwrap();
-            logd!(
+            logn!(
                 "anchor origin now (content layout) i {}, {} + {} * {} - {} = {}",
                 anchor_i,
                 anchor.entry_el.offset_top(),
@@ -936,7 +975,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
                 if !f_state.early_stop && f_state.early_reserve.len() < MIN_RESERVE {
                     let pivot = get_pivot_early(&self1.real, *feed_id, f_state).unwrap();
-                    logd!("request early (pivot {:?})", pivot);
+                    logn!("request early (pivot {:?})", pivot);
                     f_state.feed.request_before(pivot, REQUEST_COUNT);
                     requesting_early = true;
                 }
@@ -946,7 +985,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
                 if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
                     let pivot = get_pivot_late(&self1.real, *feed_id, f_state).unwrap();
-                    logd!("request late (pivot {:?})", pivot);
+                    logn!("request late (pivot {:?})", pivot);
                     f_state.feed.request_after(pivot, REQUEST_COUNT);
                     requesting_late = true;
                 }
@@ -965,7 +1004,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // Distance from content-origin to start of content
         let want_early;
         if stop_all_early {
-            want_early = (used_early + self1.early_padding).min(want_nostop_early);
+            want_early = used_early.min(want_nostop_early);
         } else {
             want_early = want_nostop_early;
         }
@@ -973,11 +1012,11 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // Distance from content-origin to end of content
         let want_late;
         if stop_all_late {
-            want_late = (used_late + self1.late_padding).min(want_nostop_late);
+            want_late = used_late.min(want_nostop_late);
         } else {
             want_late = want_nostop_late;
         }
-        logd!(
+        logn!(
             "stop all early {}, stop all late{}; want early {}, want late {}",
             stop_all_early,
             stop_all_late,
@@ -988,7 +1027,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         // # Update logical height, deferred real height update
         let new_height = (want_early + want_late).max(self1.cached_frame_height);
         if (new_height - self1.logical_content_height).abs() >= 1. {
-            logd!("requesting height {} -> {}", self1.logical_content_height, new_height);
+            logn!("requesting height {} -> {}", self1.logical_content_height, new_height);
             self1.logical_content_height = new_height;
             self1
                 .content
@@ -1009,7 +1048,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             // `logical_content_height` is padded, so this will push it to the end.
             self1.logical_content_height - (want_late + used_early),
         ) - self1.cached_real_offset;
-        logd!(
+        logn!(
             "content layout top: mix by {} ({} - {} - {} = {}, {} - {} - {} - {} = {}) = {}",
             self1.anchor_alignment,
             want_early,
@@ -1036,13 +1075,10 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         self1.logical_scroll_top =
             self1
                 .anchor_alignment
-                .mix(
-                    want_early - self1.early_padding,
-                    self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
-                )
+                .mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height)
                 .max(0.);
-        logd!(
-            "update logical scroll: {} - {} / {} from {}.mix({} - {} = {}, {} - ({} - {} = {}) - {} = {}) = {}; cl origin y is {}",
+        logn!(
+            "update logical scroll: {} - {} / {} from {}.mix({}, {} - {} - {} = {}) = {}; real origin y is {}",
             // range
             self1.logical_scroll_top,
             self1.logical_scroll_top + self1.cached_frame_height,
@@ -1051,47 +1087,31 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             self1.anchor_alignment,
             // mix 1
             want_early,
-            self1.early_padding,
-            want_early - self1.early_padding,
             // mix 2
             self1.logical_content_height,
             want_late,
-            self1.late_padding,
-            (want_late - self1.late_padding),
             self1.cached_frame_height,
-            self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
+            self1.logical_content_height - want_late - self1.cached_frame_height,
             // mix =
-            self1
-                .anchor_alignment
-                .mix(
-                    want_early - self1.early_padding,
-                    self1.logical_content_height - (want_late - self1.late_padding) - self1.cached_frame_height,
-                ),
+            self1.anchor_alignment.mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height),
             // origin
-            self1.logical_scroll_top +
-                self1.anchor_alignment.mix(self1.early_padding, self1.cached_frame_height - self1.late_padding) -
+            self1.logical_scroll_top + self1.anchor_alignment.mix(0., self1.cached_frame_height) -
                 self1.logical_content_layout_offset -
                 self1.cached_real_offset
         );
         self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
         self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
-        logd!("==============");
+        logd!("shake immediate ------------ done");
     }
 
     fn shake(&self) {
-        let mute_scroll = self.0.borrow().mute_scroll >= Utc::now();
-        if mute_scroll {
-            self.0.borrow_mut().delay_update = Some(Timeout::new(0, {
-                let state = self.weak();
-                move || {
-                    let Some(state) = state.upgrade() else {
-                        return;
-                    };
-                    state.shake_immediate();
-                }
-            }));
+        let mut self1 = self.0.borrow_mut();
+        let mute_scroll = self1.mute_scroll >= Utc::now();
+        if mute_scroll || self1.delay_shake == 0 {
+            drop(self1);
+            self.shake_immediate();
         } else {
-            self.0.borrow_mut().delay_update = Some(Timeout::new(200, {
+            self1.shake_future = Some(Timeout::new(self1.delay_shake, {
                 let state = self.weak();
                 move || {
                     let Some(state) = state.upgrade() else {
@@ -1134,7 +1154,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     prepend.push(e);
                 } else if time == self1.reset_time {
                     let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e);
-                    logd!("realize initial anchor; id {:?}", real.entry.time());
+                    logn!("realize initial anchor; id {:?}", real.entry.time());
                     self1.real.push(real);
                     self1.anchor_i = Some(0);
                 } else {
@@ -1192,7 +1212,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 return;
             }
             let feed = self1.feeds.get_mut(&feed_id).unwrap();
-            logd!(
+            logn!(
                 "??? add entries before nostop, pivot {:?}: {:?} -> {:?}",
                 initial_pivot,
                 entries.first().unwrap().time(),
@@ -1242,7 +1262,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 return;
             }
             let feed = self1.feeds.get_mut(&feed_id).unwrap();
-            logd!(
+            logn!(
                 "??? add entries after nostop, pivot {:?}: {:?} -> {:?}",
                 initial_pivot,
                 entries.first().unwrap().time(),
@@ -1262,6 +1282,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     }
 
     pub fn add_entry_after_stop(&self, feed_id: FeedId, entry: Rc<dyn Entry<Id>>) {
+        logd!("EV add after stop");
         {
             let mut self1 = self.0.borrow_mut();
             let self1 = &mut *self1;
@@ -1275,12 +1296,12 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 let feed = self1.feeds.get_mut(&feed_id).unwrap();
                 if !reserves_empty_all {
                     // Some feeds have unrealized elements, can't realize yet
-                    logd!("realtime; stopped, adding to reserve");
+                    logn!("realtime; stopped, adding to reserve");
                     if feed.late_reserve.len() < MAX_RESERVE {
                         feed.late_reserve.push_back(entry);
-                        logd!("realtime, push late reserve");
+                        logn!("realtime, push late reserve");
                     } else {
-                        logd!("realtime, stop but full, discard, now not stop");
+                        logn!("realtime, stop but full, discard, now not stop");
                         feed.late_stop = false;
                     }
                 } else {
@@ -1302,13 +1323,13 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                         let anchor_i = self1.anchor_i.unwrap();
                         if anchor_i == self1.real.len() - 1 {
                             self1.anchor_i = Some(anchor_i + 1);
-                            logd!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
+                            logn!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
                         }
                         self1.real.push(real);
                     } else if insert_before_i == 0 {
                         // Insert at start of early reserve, because insertion is unbounded within
                         // realized elements (shake will realize it if necessary) OR no real elements
-                        logd!("realtime, push early reserve");
+                        logn!("realtime, push early reserve");
                         feed.early_reserve.push_front(entry);
                         if feed.early_reserve.len() > MAX_RESERVE {
                             feed.early_reserve.truncate(MAX_RESERVE);
@@ -1320,7 +1341,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                         let anchor_i = self1.anchor_i.unwrap();
                         if insert_before_i <= anchor_i {
                             self1.anchor_i = Some(anchor_i + 1);
-                            logd!("realtime, insert before; anchor_i {:?}", self1.anchor_i);
+                            logn!("realtime, insert before; anchor_i {:?}", self1.anchor_i);
                         }
                         self1.real.insert(insert_before_i, real);
                     }
@@ -1330,7 +1351,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 let feed = self1.feeds.get_mut(&feed_id).unwrap();
                 if !feed.late_stop {
                     // This feed not stopped; might be a gap, discard - will be fetched in turn
-                    logd!("realtime, not stopped, discard");
+                    logn!("realtime, not stopped, discard");
                     return;
                 }
 
@@ -1342,13 +1363,14 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                         self1.late_sticky.push(real);
                     }
                     feed.late_reserve.push_back(entry);
-                    logd!("realtime, push late reserve");
+                    logn!("realtime, push late reserve");
                 } else {
-                    logd!("realtime, stop but full, discard, now not stop");
+                    logn!("realtime, stop but full, discard, now not stop");
                     feed.late_stop = false;
                 }
             }
         }
         self.shake();
+        logd!("EV add after stop done");
     }
 }

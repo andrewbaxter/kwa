@@ -16,6 +16,7 @@ use poem::{
     listener::TcpListener,
     middleware::{
         AddData,
+        SetHeader,
     },
     EndpointExt,
     endpoint::StaticFilesEndpoint,
@@ -76,7 +77,12 @@ async fn main() {
                     ).run(
                         Route::new()
                             .nest("/", StaticFilesEndpoint::new(&config.static_dir))
-                            .with(AddData::new(inner)),
+                            .with(AddData::new(inner))
+                            .with(
+                                SetHeader::new()
+                                    .appending("Cross-Origin-Embedder-Policy", "require-corp")
+                                    .appending("Cross-Origin-Opener-Policy", "same-origin"),
+                            ),
                     );
 
                 select!{

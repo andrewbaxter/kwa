@@ -7,8 +7,12 @@ use std::{
         RefCell,
     },
 };
-use gloo::timers::callback::{
-    Interval,
+use gloo::timers::{
+    callback::{
+        Interval,
+        Timeout,
+    },
+    future::TimeoutFuture,
 };
 use js_sys::Math::random;
 use rooting::{
@@ -160,6 +164,7 @@ fn main() {
                 spawn_local({
                     let shared = self.shared.clone();
                     async move {
+                        TimeoutFuture::new(0).await;
                         parent.add_entries_around_initial(
                             id_in_parent,
                             pivot,
@@ -230,15 +235,15 @@ fn main() {
             }
         }
 
-        //. let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, Some(5000)))]);
-        let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, None))]);
+        let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, Some(5000)))]);
+
+        //. let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, None))]);
         inf1.set_padding_post(100.);
         let inf2 = Infiniscroll::new(0, vec![Box::new(DemoFeed::new(10, None))]);
         inf2.set_padding_pre(100.);
         inf2.set_padding_post(100.);
-
-        //. set_root(vec![hbox().extend(vec![inf1.el(), inf2.el()]).own(|_| (inf1, inf2))]);
+        set_root(vec![hbox().extend(vec![inf1.el(), inf2.el()]).own(|_| (inf1, inf2))]);
         //. set_root(vec![hbox().extend(vec![inf2.el()]).own(|_| (inf2))]);
-        set_root(vec![hbox().extend(vec![inf1.el()]).own(|_| (inf1))]);
+        //. set_root(vec![hbox().extend(vec![inf1.el()]).own(|_| (inf1))]);
     });
 }
