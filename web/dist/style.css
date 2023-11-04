@@ -28,10 +28,13 @@
 }
 
 .stack {
+    flex-grow: 1;
     display: grid;
     grid-template-rows: 1fr;
     max-height: 100%;
     max-width: 100%;
+    justify-content: stretch;
+    align-items: stretch;
 }
 
 .stack>* {
@@ -55,12 +58,14 @@ body {
 }
 
 .infinite {
-    flex-grow: 1;
-    overflow-y: scroll;
-    scrollbar-width: none;
-    max-height: 100%;
-    pointer-events: initial;
-    transition: padding-top 0.2s ease-out, padding-bottom 0.2s ease-out;
+    & .frame {
+        flex-grow: 1;
+        overflow-y: scroll;
+        scrollbar-width: none;
+        max-height: 100%;
+        pointer-events: initial;
+        transition: padding-top 0.2s ease-out, padding-bottom 0.2s ease-out;
+    }
 
     & .content {
         display: flex;
@@ -90,6 +95,44 @@ body {
                 top: 0px;
                 bottom: 0px;
             }
+        }
+    }
+
+    & .center_spinner,
+    & .early_spinner,
+    & .late_spinner {
+        &.hide {
+            display: none;
+        }
+    }
+
+    & .center_spinner {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+
+        &:before {
+            content: '&&&';
+        }
+    }
+
+    & .early_spinner {
+        display: flex;
+        flex-direction: row;
+        height: 1cm;
+
+        &:before {
+            content: '^^^';
+        }
+    }
+
+    & .late_spinner {
+        display: flex;
+        flex-direction: row;
+        height: 1cm;
+
+        &:before {
+            content: 'vvv';
         }
     }
 }

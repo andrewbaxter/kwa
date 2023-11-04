@@ -175,7 +175,9 @@ fn main() {
                 spawn_local({
                     let shared = self.shared.clone();
                     async move {
-                        TimeoutFuture::new(0).await;
+                        TimeoutFuture::new((5000.) as u32).await;
+
+                        //. TimeoutFuture::new(0).await;
                         parent.add_entries_around_initial(
                             id_in_parent,
                             pivot,

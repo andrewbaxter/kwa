@@ -230,6 +230,7 @@ impl<Id: IdTraits> FeedState<Id> {
 struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
     /// Used when new/resetting
     reset_time: Id,
+    outer_stack: El,
     frame: El,
     cached_frame_height: f64,
     content: El,
@@ -508,16 +509,16 @@ pub struct Infiniscroll<Id: IdTraits>(Rc<RefCell<Infiniscroll_<Id>>>);
 
 impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     pub fn new(reset_id: Id, feeds: Vec<Box<dyn Feed<Id>>>) -> Self {
-        let outer_stack = stack();
-        let frame = el("div").classes(&["infinite"]);
+        let outer_stack = stack().classes(&["infinite"]);
+        let frame = el("div").classes(&["frame"]);
         let content = el("div").classes(&["content"]);
         let content_layout = el("div").classes(&["content_layout"]);
         let content_lines_early_sticky = Container::new(el("div").classes(&["sticky"]));
         let content_lines_real = Container::new(el("div").classes(&["real"]));
         let content_lines_late_sticky = Container::new(el("div").classes(&["sticky"]));
         let center_spinner = el("div").classes(&["center_spinner"]);
-        let early_spinner = el("div").classes(&["early_spinner"]);
-        let late_spinner = el("div").classes(&["late_spinner"]);
+        let early_spinner = el("div").classes(&["early_spinner", CSS_HIDE]);
+        let late_spinner = el("div").classes(&["late_spinner", CSS_HIDE]);
         outer_stack.ref_extend(vec![frame.clone(), center_spinner.clone()]);
         frame.ref_push(content.clone());
         content.ref_push(content_layout.clone());
@@ -532,6 +533,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         );
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
             reset_time: reset_id,
+            outer_stack: outer_stack,
             frame: frame.clone(),
             cached_frame_height: 0.,
             content: content.clone(),
@@ -659,7 +661,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     }
 
     pub fn el(&self) -> El {
-        return self.0.borrow().frame.clone();
+        return self.0.borrow().outer_stack.clone();
     }
 
     pub fn set_padding_pre(&self, padding: f64) {
@@ -1059,9 +1061,9 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
             }
         }
-        self1.center_spinner.ref_modify_classes(&[(CSS_HIDE, self1.real.is_empty() && requesting_early)]);
-        self1.early_spinner.ref_modify_classes(&[(CSS_HIDE, !self1.real.is_empty() && requesting_early)]);
-        self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !self1.real.is_empty() && requesting_late)]);
+        self1.center_spinner.ref_modify_classes(&[(CSS_HIDE, !(self1.real.is_empty() && requesting_early))]);
+        self1.early_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_early))]);
+        self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_late))]);
         self1.cached_real_offset = self1.real.el().offset_top();
 
         // # Update alignment based on used space, stop states
