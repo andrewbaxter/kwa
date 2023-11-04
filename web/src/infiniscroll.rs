@@ -1,7 +1,7 @@
 //! # Control
 //!
 //! The infiniscroll deals with lots of shakey parts by maintaining a limited set
-//! of "desired" state, and the rest is synced to that:
+//! of "logical" state, and the rest is synced to that:
 //!
 //! * Anchor element - which element is the screen "anchor".
 //!
@@ -18,14 +18,17 @@
 //! When the user scrolls to the end/start, or the stop element is reached via
 //! pulling, the alignment is changed.
 //!
-//! Scrolling, resizing, etc. subsequently "shake" everything to remove wrinkles,
-//! matching everything with the above values, triggering new entry requests, etc.
+//! Human-initiated scrolling, resizing, etc. subsequently "shake" everything to
+//! remove wrinkles, matching everything with the above values, triggering new
+//! entry requests, etc.
 //!
 //! # Shake
 //!
 //! Shake has two parts
 //!
-//! 1. Coming up with logical element layout
+//! 1. Coming up with logical element layout.  This uses the logical values above, plus
+//!    the computed element heights (which we don't manage logically, since for sticky we
+//!    need to leave it to the DOM).
 //!
 //! 2. Matching the view to that layout
 //!
@@ -40,6 +43,42 @@
 //!
 //! When the reserve is consumed, if the next item is sticky, it's just moved out
 //! of the sticky bucket.
+//!
+//! # Implementation notes
+//!
+//! ## Multi-feed stop status and sorting
+//!
+//! The real elements are guaranteed to be ordered and gapless for all the feeds.
+//! Basically we compare the next element in each feed before realizing, and always
+//! realize the nearest element.  This means that if a feed does not have a next
+//! element to compare, we can't complete the comparison, so we can't realize new
+//! elements.  In this case we request new elements and wait for them to arrive
+//! before realizing further.
+//!
+//! If there really are no elements, the remaining elements in each feed reserve
+//! can be realized in sorted order. We indicate this with the stop marker.
+//!
+//! There's a race condition when new elements are created while in the stop state
+//! (i.e. transitioning back to non-stop, although depending on the situation it
+//! may be a temporary un-stop where we don't change the marker).  We can't know if
+//! more elements will be created, so when we receive new elements at the end we
+//! realize them immediately, but others come from another feed after that they may
+//! have an order earlier than the previously realized elements, so when we receive
+//! new elements at the end they must always be sorted in.
+//!
+//! ## Single feed stop status with async creation
+//!
+//! If we receive a notification of a new element while in a state where we don't
+//! need it (scrolled up), we discard it.  However, there's a race condition where
+//! if we're requesting new elements, and a new element is created after the server
+//! looks up the elements but before the client receives the response, the response
+//! won't include the new element.  If the notification arrives before the
+//! response, we may discard it,
+//!
+//! The infiniscroll takes care of this currently.  When we receive a notification,
+//! or an end fill occurs but doesn't reach the end, we always request elements
+//! after the last known element in the feed, so any missing elements will be
+//! included.
 use std::{
     rc::{
         Rc,
@@ -135,14 +174,11 @@ impl<Id> ContainerEntry for EntryState<Id> {
 }
 
 /// A data source for the inifiniscroller. When it gets requests for elements, it
-/// must only call the parent `add` functions after the stack unwinds (spawn or
-/// timer next tick).
+/// must only call the parent `respond_` and `notify_` functions after the stack
+/// unwinds (spawn or timer next tick).
 ///
-/// The stop states of the feed are controlled by the feed when it calls `add`
-/// methods.  `add_entry_after_stop` will be discarded if not in the stop state but
-/// if it is in the stop state, the element added must be the element immediately
-/// after the last `add_entry_after_nostop` entry when the stop state was entered,
-/// or immediately following a previous entry added with `add_entry_after_stop`.
+/// The stop states of the feed are controlled by the feed when it calls `respond_`
+/// methods.
 pub trait Feed<Id: IdTraits> {
     fn set_parent(&self, parent: WeakInfiniscroll<Id>, id_in_parent: FeedId);
     fn request_around(&self, time: Id, count: usize);
@@ -162,6 +198,33 @@ struct FeedState<Id> {
     late_reserve: VecDeque<Rc<dyn Entry<Id>>>,
     early_stop: bool,
     late_stop: bool,
+    latest_known: Option<Id>,
+    earliest_known: Option<Id>,
+}
+
+impl<Id: IdTraits> FeedState<Id> {
+    fn update_earliest_known(&mut self, time: Id) {
+        match &self.earliest_known {
+            Some(i) => if time < *i {
+                self.earliest_known = Some(time);
+            },
+            None => self.earliest_known = Some(time),
+        }
+    }
+
+    fn update_latest_known(&mut self, time: Id) -> bool {
+        match &self.latest_known {
+            Some(i) => if time > *i {
+                self.latest_known = Some(time);
+                return true;
+            },
+            None => {
+                self.latest_known = Some(time);
+                return true;
+            },
+        }
+        return false;
+    }
 }
 
 struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
@@ -515,6 +578,8 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     late_reserve: VecDeque::new(),
                     early_stop: false,
                     late_stop: false,
+                    earliest_known: None,
+                    latest_known: None,
                 });
             }
             state1.entry_resize_observer = entry_resize_observer;
@@ -522,7 +587,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         frame.ref_on("scroll", {
             let state = state.weak();
             move |_event| {
-                logd!("EV scroll");
+                logn!("EV scroll");
                 let Some(state) = state.upgrade() else {
                     return;
                 };
@@ -537,14 +602,14 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     state1.delay_shake = 200;
                 }
                 state.shake();
-                logd!("EV scroll done");
+                logn!("EV scroll done");
             }
         });
         frame.ref_on_resize({
             // Frame height change
             let state = state.weak();
             move |_, _, frame_height| {
-                logd!("EV frame resize");
+                logn!("EV frame resize");
                 let Some(state) = state.upgrade() else {
                     return;
                 };
@@ -557,7 +622,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                     state1.mute_scroll = Utc::now() + Duration::milliseconds(50);
                 }
                 state.shake();
-                logd!("EV frame resize done");
+                logn!("EV frame resize done");
             }
         });
         content.ref_on_resize({
@@ -565,7 +630,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             let state = state.weak();
             let old_content_height = Cell::new(-1.0f64);
             move |_, _, content_height| {
-                logd!("EV content resize");
+                logn!("EV content resize");
                 let Some(state) = state.upgrade() else {
                     return;
                 };
@@ -582,7 +647,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 );
                 self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
                 self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
-                logd!("EV content resize done");
+                logn!("EV content resize done");
             }
         });
         state.shake_immediate();
@@ -639,6 +704,8 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 f.early_stop = false;
                 f.late_stop = false;
                 f.initial = true;
+                f.earliest_known = None;
+                f.latest_known = None;
             }
         }
         self.shake_immediate();
@@ -981,6 +1048,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
                 if f_state.late_reserve.len() > MAX_RESERVE {
                     f_state.late_reserve.truncate(MAX_RESERVE);
+                    logd!("unset late stop, trunc reserve over max");
                     f_state.late_stop = false;
                 }
                 if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
@@ -1123,6 +1191,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         }
     }
 
+    /// Called by feed, in response to `request__around`.
     pub fn add_entries_around_initial(
         &self,
         feed_id: FeedId,
@@ -1150,6 +1219,8 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             let mut postpend = vec![];
             for e in entries {
                 let time = e.time();
+                feed.update_earliest_known(time.clone());
+                feed.update_earliest_known(time.clone());
                 if time < self1.reset_time {
                     prepend.push(e);
                 } else if time == self1.reset_time {
@@ -1183,14 +1254,24 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         self.shake();
     }
 
-    /// Entries must be sorted latest to earliest.
-    pub fn add_entries_before_nostop(
+    /// Called by feed in response to `request_before`.
+    ///
+    /// * `initial_pivot` is the pivot `request_before` was called with.
+    ///
+    /// * `entries` must be sorted latest to earliest.
+    ///
+    /// * `stop` indicates whether the server knows of more entries past the most extreme
+    ///   entry at the time the request was received.
+    pub fn respond_entries_before(
         &self,
         feed_id: FeedId,
         initial_pivot: Id,
         entries: Vec<Rc<dyn Entry<Id>>>,
-        stop: bool,
+        mut stop: bool,
     ) {
+        if entries.is_empty() {
+            return;
+        }
         assert!(bb!{
             'assert _;
             let mut at = initial_pivot.clone();
@@ -1211,13 +1292,21 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             if initial_pivot != current_pivot {
                 return;
             }
-            let feed = self1.feeds.get_mut(&feed_id).unwrap();
+            let feed_state = self1.feeds.get_mut(&feed_id).unwrap();
+            {
+                let earliest_known = feed_state.earliest_known.clone().unwrap();
+                if initial_pivot != earliest_known && entries.iter().all(|e| e.time() != earliest_known) {
+                    // Know of element beyond this result (via an async channel)
+                    stop = false;
+                }
+            }
             logn!(
                 "??? add entries before nostop, pivot {:?}: {:?} -> {:?}",
                 initial_pivot,
                 entries.first().unwrap().time(),
                 entries.last().unwrap().time()
             );
+            feed_state.update_earliest_known(entries.last().unwrap().time());
             let mut prepend_sticky = vec![];
             for e in entries.iter().rev() {
                 if self1.sticky_set.contains(&e.time()) {
@@ -1226,21 +1315,32 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 }
             }
             self1.early_sticky.splice(0, 0, prepend_sticky);
-            feed.early_reserve.extend(entries);
-            feed.early_stop = stop;
+            feed_state.early_reserve.extend(entries);
+            feed_state.early_stop = stop;
             self1.transition_alignment_reanchor();
         }
         self.shake();
     }
 
-    /// Entries must be sorted earliest to latest.
-    pub fn add_entries_after_nostop(
+    /// Called by `feed` in response to `request_after`.
+    ///
+    /// * `initial_pivot` - The pivot `request_after` was called with.
+    ///
+    /// * `entries` must be sorted earliest to latest.
+    ///
+    /// * `stop` indicates whether the server knows of more entries past the most extreme
+    ///   entry at the time the request was received.
+    pub fn respond_entries_after(
         &self,
         feed_id: FeedId,
         initial_pivot: Id,
-        entries: Vec<Rc<dyn Entry<Id>>>,
-        stop: bool,
+        mut entries: Vec<Rc<dyn Entry<Id>>>,
+        mut stop: bool,
     ) {
+        logd!("EV respond entries after, {:?} len {}", initial_pivot, entries.len());
+        if entries.is_empty() {
+            return;
+        }
         assert!(bb!{
             'assert _;
             let mut at = initial_pivot.clone();
@@ -1261,64 +1361,137 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             if initial_pivot != current_pivot {
                 return;
             }
-            let feed = self1.feeds.get_mut(&feed_id).unwrap();
-            logn!(
-                "??? add entries after nostop, pivot {:?}: {:?} -> {:?}",
-                initial_pivot,
-                entries.first().unwrap().time(),
-                entries.last().unwrap().time()
-            );
-            for e in entries.iter() {
-                if self1.sticky_set.contains(&e.time()) {
-                    let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    self1.late_sticky.push(real);
+            let mut all_stopped = true;
+            let mut all_reserve_empty = true;
+            for feed_state in self1.feeds.values() {
+                if !feed_state.late_stop {
+                    all_stopped = false;
+                }
+                if !feed_state.late_reserve.is_empty() {
+                    all_reserve_empty = false;
                 }
             }
-            feed.late_reserve.extend(entries);
-            feed.late_stop = stop;
-            self1.transition_alignment_reanchor();
-        }
-        self.shake();
-    }
+            let feed_state = self1.feeds.get_mut(&feed_id).unwrap();
+            let mut inferred_stop = true;
+            {
+                let latest_known = feed_state.latest_known.clone().unwrap();
+                if initial_pivot != latest_known && entries.iter().all(|e| e.time() != latest_known) {
+                    logd!("resp doesn't include latest known {:?}, set stop = false", latest_known);
 
-    pub fn add_entry_after_stop(&self, feed_id: FeedId, entry: Rc<dyn Entry<Id>>) {
-        logd!("EV add after stop");
-        {
-            let mut self1 = self.0.borrow_mut();
-            let self1 = &mut *self1;
-            let mut stop_all = true;
-            let mut reserves_empty_all = true;
-            for f in self1.feeds.values() {
-                stop_all = stop_all && f.late_stop;
-                reserves_empty_all = reserves_empty_all && f.late_reserve.is_empty();
+                    // Know of element beyond this result (via an async channel)
+                    inferred_stop = false;
+                }
             }
-            if stop_all {
-                let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                if !reserves_empty_all {
-                    // Some feeds have unrealized elements, can't realize yet
-                    logn!("realtime; stopped, adding to reserve");
-                    if feed.late_reserve.len() < MAX_RESERVE {
-                        feed.late_reserve.push_back(entry);
-                        logn!("realtime, push late reserve");
-                    } else {
-                        logn!("realtime, stop but full, discard, now not stop");
-                        feed.late_stop = false;
+
+            bb!{
+                'done_adding _;
+                macro_rules! add_to_reserve{
+                    () => {
+                        for entry in entries {
+                            if feed_state.late_reserve.len() < MAX_RESERVE {
+                                let entry_time = entry.time();
+                                if self1.sticky_set.contains(&entry_time) {
+                                    let real =
+                                        realize_entry(
+                                            self1.entry_resize_observer.as_ref().unwrap(),
+                                            feed_id,
+                                            entry.clone(),
+                                        );
+
+                                    bb!{
+                                        'sort_insert _;
+                                        for (i, o) in self1.late_sticky.iter().enumerate() {
+                                            if entry_time < o.entry.time() {
+                                                self1.late_sticky.insert(i, real);
+                                                break 'sort_insert;
+                                            }
+                                        }
+                                        self1.late_sticky.push(real);
+                                        break 'sort_insert;
+                                    };
+                                }
+                                feed_state.late_reserve.push_back(entry);
+                                logn!("realtime, push late reserve");
+                            } else {
+                                logn!("realtime, stop but full, discard, now not stop");
+                                stop = false;
+                                break;
+                            }
+                        }
+                    };
+                }
+                // Already a reserve, new elements guaranteed to be ordered afterwards
+                if !feed_state.late_reserve.is_empty() {
+                    logd!("has late reserve, append to reserve");
+                    add_to_reserve!();
+                    logd!("set late stop = {}", stop);
+                    feed_state.late_stop = stop;
+                    break 'done_adding;
+                }
+                // No reserve, new elements could need to be sorted into real depending on how
+                // feed events interleaved
+                let real_latest_time = self1.real.last().unwrap().entry.time();
+                entries.reverse();
+                let mut last_insert_before_i = 0;
+                loop {
+                    let Some(entry) = entries.last() else {
+                        break;
+                    };
+                    let entry_time = entry.time();
+                    if entry_time >= real_latest_time {
+                        break;
                     }
-                } else {
-                    // All feeds stopped, all elements realized, this is the next element so realize
-                    // immediately
-                    let time = entry.time();
+                    logd!("sort inserting entry {:?}", entry_time);
+                    let entry = entries.pop().unwrap();
                     let insert_before_i = bb!{
                         'find_insert _;
-                        for (i, real_state) in self1.real.iter().enumerate().rev() {
-                            if time > real_state.entry.time() {
+                        for (i, real_state) in self1.real.iter().enumerate().skip(last_insert_before_i).rev() {
+                            if entry_time > real_state.entry.time() {
                                 break 'find_insert i + 1;
                             }
                         }
-                        break 0;
+                        break 'find_insert 0;
                     };
-                    if insert_before_i == self1.real.len() {
-                        // Insert at end
+                    last_insert_before_i = insert_before_i;
+                    if insert_before_i == 0 {
+                        // Insert at start of early reserve, because insertion is unbounded within
+                        // realized elements (shake will realize it if necessary) OR no real elements
+                        logd!("sort into early reserve");
+                        if self1.sticky_set.contains(&entry_time) {
+                            let real =
+                                realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry.clone());
+
+                            bb!{
+                                'sort_insert _;
+                                for (i, o) in self1.early_sticky.iter().enumerate() {
+                                    if entry_time > o.entry.time() {
+                                        self1.early_sticky.insert(i, real);
+                                        break 'sort_insert;
+                                    }
+                                }
+                                self1.late_sticky.push(real);
+                                break 'sort_insert;
+                            };
+                        }
+                        feed_state.early_reserve.push_front(entry);
+                    } else {
+                        // Insert within real elements
+                        let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
+                        let anchor_i = self1.anchor_i.unwrap();
+                        if insert_before_i <= anchor_i {
+                            self1.anchor_i = Some(anchor_i + 1);
+                            logn!("sort into real; anchor_i {:?}", self1.anchor_i);
+                        }
+                        self1.real.insert(insert_before_i, real);
+                    }
+                }
+                // Remaining new elements come after the final real element
+                entries.reverse();
+                if all_stopped && all_reserve_empty {
+                    // No other feeds have reserve so these are the guaranteed next (of known
+                    // elements) - go ahead and realize.
+                    for entry in entries {
+                        logd!("append to real");
                         let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
                         let anchor_i = self1.anchor_i.unwrap();
                         if anchor_i == self1.real.len() - 1 {
@@ -1326,51 +1499,41 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                             logn!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
                         }
                         self1.real.push(real);
-                    } else if insert_before_i == 0 {
-                        // Insert at start of early reserve, because insertion is unbounded within
-                        // realized elements (shake will realize it if necessary) OR no real elements
-                        logn!("realtime, push early reserve");
-                        feed.early_reserve.push_front(entry);
-                        if feed.early_reserve.len() > MAX_RESERVE {
-                            feed.early_reserve.truncate(MAX_RESERVE);
-                            feed.early_stop = false;
-                        }
-                    } else {
-                        // Insert within real elements
-                        let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
-                        let anchor_i = self1.anchor_i.unwrap();
-                        if insert_before_i <= anchor_i {
-                            self1.anchor_i = Some(anchor_i + 1);
-                            logn!("realtime, insert before; anchor_i {:?}", self1.anchor_i);
-                        }
-                        self1.real.insert(insert_before_i, real);
+                    }
+                    if stop && !inferred_stop {
+                        let pivot = get_pivot_late(&self1.real, feed_id, feed_state).unwrap();
+                        feed_state.feed.request_after(pivot, REQUEST_COUNT)
                     }
                 }
-            } else {
-                // Some feeds not stopped
-                let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                if !feed.late_stop {
-                    // This feed not stopped; might be a gap, discard - will be fetched in turn
-                    logn!("realtime, not stopped, discard");
-                    return;
-                }
+                else {
+                    logd!("not stopped/reserve empty, add to reserve");
 
-                // This feed is stop, so add to reserve
-                if feed.late_reserve.len() < MAX_RESERVE {
-                    if self1.sticky_set.contains(&entry.time()) {
-                        let real =
-                            realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry.clone());
-                        self1.late_sticky.push(real);
-                    }
-                    feed.late_reserve.push_back(entry);
-                    logn!("realtime, push late reserve");
-                } else {
-                    logn!("realtime, stop but full, discard, now not stop");
-                    feed.late_stop = false;
+                    // Other feeds have reserve so these need to be pulled in by ordering (because
+                    // there's reserve we can't be anchored at last element anyway)
+                    add_to_reserve!();
                 }
-            }
+                logd!("set late stop = {}", stop);
+                feed_state.late_stop = stop;
+            };
         }
         self.shake();
-        logd!("EV add after stop done");
+        logd!("EV respond entries after, DONE");
+    }
+
+    /// Called by feed when notified of new entries. Note that this may immediately
+    /// call `request_after` (re-entering feed stack context) so be careful of hodling
+    /// borrows when calling this.
+    pub fn notify_entry_after(&self, feed_id: FeedId, entry_id: Id) {
+        logd!("EV notify after, {:?}", entry_id);
+        let mut self1 = self.0.borrow_mut();
+        let self1 = &mut *self1;
+        let f_state = self1.feeds.get_mut(&feed_id).unwrap();
+        if f_state.update_latest_known(entry_id) && f_state.late_stop {
+            if f_state.late_stop {
+                logd!("-> request after");
+                let pivot = get_pivot_late(&self1.real, feed_id, f_state).unwrap();
+                f_state.feed.request_after(pivot, REQUEST_COUNT)
+            }
+        }
     }
 }
