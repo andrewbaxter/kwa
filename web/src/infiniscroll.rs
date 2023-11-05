@@ -564,7 +564,11 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 let Some(state) = state.upgrade() else {
                     return;
                 };
-                //. .state.shake();
+                {
+                    let mut state1 = state.0.borrow_mut();
+                    state1.mute_scroll = Utc::now() + Duration::milliseconds(50);
+                }
+                state.shake();
             }
         }));
         {
