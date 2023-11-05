@@ -279,9 +279,8 @@ struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
 
 fn calc_anchor_offset(real_origin_y: f64, anchor_top: f64, anchor_height: f64, anchor_alignment: f64) -> f64 {
     let anchor_origin_y = anchor_top + anchor_height * anchor_alignment;
-    let anchor_offset =
-        (anchor_origin_y - real_origin_y).clamp(-anchor_height * anchor_alignment, anchor_height * anchor_alignment);
-    logn!(
+    let anchor_offset = anchor_origin_y - real_origin_y;
+    logd!(
         "new anchor origin offset {} + {} * {} = {}, - {} = {}",
         anchor_top,
         anchor_height,
@@ -300,7 +299,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             if e_state.entry_el.offset_top() > real_origin_y {
                 break;
             }
-            logn!(
+            logd!(
                 "move anchor_i +1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
@@ -317,7 +316,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             if anchor_i == 0 {
                 break;
             }
-            logn!(
+            logd!(
                 "move anchor_i -1: {} = {} > {}",
                 e_state.entry_el.offset_top(),
                 e_state.entry_el.offset_top(),
@@ -349,7 +348,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
                 self.logical_scroll_top + self.anchor_alignment.mix(0., self.cached_frame_height)
                 // Origin in content-layout space
                 - self.logical_content_layout_offset - self.cached_real_offset;
-            logn!(
+            logd!(
                 "scroll reanchor: origin y {} + {}.mix({}, {}) - {} - {} = {}",
                 self.logical_scroll_top,
                 self.anchor_alignment,
@@ -366,7 +365,7 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
             self.anchor_i = None;
             self.anchor_offset = 0.;
         }
-        logn!("Reanchor {:?} {} to {:?} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
+        logd!("Reanchor {:?} {} to {:?} {}", old_anchor_i, old_anchor_offset, self.anchor_i, self.anchor_offset);
     }
 
     // Change anchor based on logical values (anchor, alignment), + frame height
