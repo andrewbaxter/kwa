@@ -1194,7 +1194,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     }
 
     /// Called by feed, in response to `request__around`.
-    pub fn add_entries_around_initial(
+    pub fn respond_entries_around(
         &self,
         feed_id: FeedId,
         pivot: Id,
@@ -1260,7 +1260,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     ///
     /// * `initial_pivot` is the pivot `request_before` was called with.
     ///
-    /// * `entries` must be sorted latest to earliest.
+    /// * `entries` must be sorted latest to earliest (descending).
     ///
     /// * `stop` indicates whether the server knows of more entries past the most extreme
     ///   entry at the time the request was received.
@@ -1345,6 +1345,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         }
         assert!(bb!{
             'assert _;
+            // Confirm sorting
             let mut at = initial_pivot.clone();
             for e in &entries {
                 if e.time() <= at {
