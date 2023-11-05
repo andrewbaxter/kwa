@@ -691,8 +691,38 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     }
 
     pub fn jump(&self, time: Id) {
-        {
+        bb!{
+            'done _;
             let mut self1 = self.0.borrow_mut();
+            let after = bb!{
+                'found _;
+                for (i, e) in self1.real.iter().enumerate() {
+                    let e_time = e.entry.time();
+                    if e_time == time {
+                        self1.anchor_i = Some(i);
+                        self1.anchor_alignment = 0.5;
+                        self1.anchor_offset = 0.;
+                        break 'done;
+                    }
+                    if e_time > time {
+                        break 'found Some(i);
+                    }
+                }
+                break 'found None;
+            };
+            match after {
+                // After end
+                None => (),
+                // Before start
+                Some(0) => (),
+                // Middle
+                Some(i) => {
+                    self1.anchor_i = Some(i);
+                    self1.anchor_alignment = 0.5;
+                    self1.anchor_offset = 0.;
+                    break 'done;
+                },
+            }
             self1.reset_time = time;
             self1.real.clear();
             self1.anchor_i = None;
@@ -710,6 +740,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
                 f.latest_known = None;
             }
         }
+
         self.shake_immediate();
     }
 
