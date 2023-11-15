@@ -1,4 +1,7 @@
-use std::future::Future;
+use std::{
+    future::Future,
+    pin::Pin,
+};
 use lunk::{
     ProcessingContext,
     Prim,
@@ -50,19 +53,8 @@ pub fn icon(name: &str) -> El {
     return el("span").classes(&["material-icons-outlined"]).text(name);
 }
 
-pub fn button_text(text: &str, mut cb: impl FnMut() -> () + 'static) -> El {
-    return el("button")
-        .classes(&["button", "button_text"])
-        .push(el("span").text(text))
-        .on("click", move |_| cb());
-}
-
-pub fn button_icon(icon_id: &str, mut cb: impl FnMut() -> () + 'static) -> El {
-    return el("button").classes(&["button", "button_icon"]).push(icon(icon_id)).on("click", move |_| cb());
-}
-
-pub fn button_image(image_src: &str, mut cb: impl FnMut() -> () + 'static) -> El {
-    return el("button").classes(&["button", "button_icon"]).push(image(image_src)).on("click", move |_| cb());
+pub fn button(mut cb: impl FnMut() -> () + 'static) -> El {
+    return el("button").classes(&["button"]).on("click", move |_| cb());
 }
 
 pub fn modal(title: &str, mut back_cb: impl FnMut() -> () + 'static, child: El) -> El {
@@ -87,6 +79,26 @@ pub fn dialpad_button(icon_id: &str, text: &str, mut cb: impl FnMut() -> () + 's
         .on("click", move |_| cb());
 }
 
+pub trait ElExt {
+    fn ref_bind_text(&self, pc: &mut ProcessingContext, text: &Prim<String>) -> &Self;
+    fn bind_text(self, pc: &mut ProcessingContext, text: &Prim<String>) -> Self;
+}
+
+impl ElExt for El {
+    fn ref_bind_text(&self, pc: &mut ProcessingContext, text: &Prim<String>) -> &Self {
+        self.ref_own(|e| link!((_pc = pc), (text = text), (), (e = e.weak()) {
+            let e = e.upgrade()?;
+            e.ref_text(&*text.borrow());
+        }));
+        return self;
+    }
+
+    fn bind_text(self, pc: &mut ProcessingContext, text: &Prim<String>) -> Self {
+        self.ref_bind_text(pc, text);
+        return self;
+    }
+}
+
 pub fn bound_list<
     T: Clone + 'static,
 >(pc: &mut ProcessingContext, list: &List<T>, map_child: impl Fn(&mut ProcessingContext, &T) -> El + 'static) -> El {
@@ -105,56 +117,62 @@ pub enum AsyncState {
     Error(String),
 }
 
-pub fn async_result<
-    F: Future<Output = Result<(), String>> + 'static,
->(pc: &mut ProcessingContext) -> (Prim<AsyncState>, Box<dyn Fn(F) -> ()>) {
-    let result = Prim::new(pc, AsyncState::None);
-    let eg = pc.eg();
-    return (result.clone(), Box::new({
-        let eg = eg.clone();
+pub fn async_area(
+    pc: &mut ProcessingContext,
+    child: &El,
+) -> (El, Box<dyn Fn(Pin<Box<dyn Future<Output = Result<(), String>>>>) -> ()>) {
+    let async_state = Prim::new(pc, AsyncState::None);
+    let error = el("span").classes(&["error"]);
+    let overlay = el("div").classes(&["async_overlay"]);
+    let e =
+        stack()
+            .extend(vec![vbox().extend(vec![error.clone(), child.clone()]), overlay.clone()])
+            .own(
+                |_| link!(
+                    (_pc = pc),
+                    (state = async_state.clone()),
+                    (),
+                    (error = error.clone(), overlay = overlay.clone()) {
+                        match &*state.borrow() {
+                            AsyncState::None => {
+                                error.ref_classes(&[CSS_HIDE]);
+                                overlay.ref_classes(&[CSS_HIDE]);
+                            },
+                            AsyncState::InProgress => {
+                                error.ref_classes(&[CSS_HIDE]);
+                                overlay.ref_remove_classes(&[CSS_HIDE]);
+                            },
+                            AsyncState::Error(text) => {
+                                error.ref_classes(&[CSS_HIDE]);
+                                error.ref_text(&text);
+                                overlay.ref_classes(&[CSS_HIDE]);
+                            },
+                        }
+                    }
+                ),
+            );
+    let do_async = Box::new({
+        let eg = pc.eg();
         move |f| {
             let eg = eg.clone();
-            let result = result.clone();
+            let async_state = async_state.clone();
             spawn_local(async move {
                 eg.event(|pc| {
-                    result.set(pc, AsyncState::InProgress);
+                    async_state.set(pc, AsyncState::InProgress);
                 });
                 let res = f.await;
                 eg.event(|pc| {
                     match res {
                         Ok(_) => {
-                            result.set(pc, AsyncState::None);
+                            async_state.set(pc, AsyncState::None);
                         },
                         Err(e) => {
-                            result.set(pc, AsyncState::Error(e));
+                            async_state.set(pc, AsyncState::Error(e));
                         },
                     };
                 });
             });
         }
-    }));
-}
-
-pub fn async_area(pc: &mut ProcessingContext, child: El, async_state: Prim<AsyncState>) -> El {
-    let error = el("span").classes(&["error"]);
-    let overlay = el("div").classes(&["async_overlay"]);
-    return stack()
-        .extend(vec![vbox().extend(vec![error.clone(), child]), overlay.clone()])
-        .own(|_| link!((_pc = pc), (state = async_state), (), (error = error.clone(), overlay = overlay.clone()) {
-            match state.get() {
-                AsyncState::None => {
-                    error.ref_classes(&[CSS_HIDE]);
-                    overlay.ref_classes(&[CSS_HIDE]);
-                },
-                AsyncState::InProgress => {
-                    error.ref_classes(&[CSS_HIDE]);
-                    overlay.ref_remove_classes(&[CSS_HIDE]);
-                },
-                AsyncState::Error(text) => {
-                    error.ref_classes(&[CSS_HIDE]);
-                    error.ref_text(&text);
-                    overlay.ref_classes(&[CSS_HIDE]);
-                },
-            }
-        }));
+    });
+    return (e, do_async);
 }

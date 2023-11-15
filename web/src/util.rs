@@ -5,6 +5,7 @@ use std::{
         Add,
         Mul,
     },
+    future::Future,
 };
 use gloo::storage::{
     LocalStorage,
@@ -23,6 +24,7 @@ use serde::{
     de::DeserializeOwned,
     Serialize,
 };
+use wasm_bindgen_futures::spawn_local;
 
 pub trait MoreMath {
     fn mix<T: Copy + Sub<Output = T> + Add<Output = T> + Mul<f64, Output = T>>(self, a: T, b: T) -> T;
@@ -106,6 +108,34 @@ impl<T, E: Display> MyError<T> for Result<T, E> {
     }
 }
 
+impl<T> MyError<T> for Option<T> {
+    fn log_ignore(self, context: &str) {
+        match self {
+            Some(_) => { },
+            None => {
+                log!("{}: missing value", context);
+            },
+        }
+    }
+
+    fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String> {
+        match self {
+            Some(v) => return Ok(v),
+            None => {
+                log!("{}: missing value", context);
+                return Err(replacement.to_string());
+            },
+        }
+    }
+
+    fn context(self, context: &str) -> Result<T, String> {
+        match self {
+            Some(v) => return Ok(v),
+            None => return Err(format!("{}: missing value", context)),
+        };
+    }
+}
+
 pub fn local_state<
     T: PartialEq + Clone + Serialize + DeserializeOwned + 'static,
 >(pc: &mut ProcessingContext, key: &'static str, default: impl Fn() -> T) -> (lunk::Prim<T>, ScopeValue) {
@@ -121,7 +151,7 @@ pub fn local_state<
             }).unwrap_or_else(default),
         );
     let drop = scope_any(link!((_pc = pc), (p = p.clone()), (), (key = key) {
-        LocalStorage::set(key, serde_json::to_string(&p.get()).unwrap()).unwrap();
+        LocalStorage::set(key, serde_json::to_string(&*p.borrow()).unwrap()).unwrap();
     }));
     return (p, drop);
 }
@@ -141,7 +171,28 @@ pub fn session_state<
             }).unwrap_or_else(default),
         );
     let drop = scope_any(link!((_pc = pc), (p = p.clone()), (), (key = key) {
-        SessionStorage::set(key, serde_json::to_string(&p.get()).unwrap()).unwrap();
+        SessionStorage::set(key, serde_json::to_string(&*p.borrow()).unwrap()).unwrap();
     }));
     return (p, drop);
+}
+
+pub fn bg<F: 'static + Future<Output = Result<(), String>>>(f: F) {
+    spawn_local(async move {
+        match f.await {
+            Ok(_) => { },
+            Err(e) => {
+                log!("Background activity failed with error: {}", e);
+            },
+        };
+    });
+}
+
+#[macro_export]
+macro_rules! enum_unwrap{
+    ($i: expr, $p: pat => $o: expr) => {
+        match $i {
+            $p => $o,
+            _ => panic !(""),
+        }
+    };
 }

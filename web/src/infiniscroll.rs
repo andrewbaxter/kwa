@@ -667,7 +667,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         return self.0.borrow().outer_stack.clone();
     }
 
-    pub fn set_padding_pre(&self, padding: f64) {
+    pub fn set_padding_pre(&self, padding: &str) {
         self
             .0
             .borrow()
@@ -676,11 +676,11 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             .dyn_ref::<HtmlElement>()
             .unwrap()
             .style()
-            .set_property("padding-top", &format!("{}px", padding))
+            .set_property("padding-top", &padding)
             .unwrap();
     }
 
-    pub fn set_padding_post(&self, padding: f64) {
+    pub fn set_padding_post(&self, padding: &str) {
         self
             .0
             .borrow()
@@ -689,7 +689,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             .dyn_ref::<HtmlElement>()
             .unwrap()
             .style()
-            .set_property("padding-bottom", &format!("{}px", padding))
+            .set_property("padding-bottom", &padding)
             .unwrap();
     }
 
@@ -795,6 +795,28 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             }
         }
         self.shake();
+    }
+
+    pub fn clear_sticky(&self) {
+        let mut found = false;
+        {
+            let mut self1 = self.0.borrow_mut();
+            let self1 = &mut *self1;
+            self1.sticky_set.clear();
+            for s in self1.early_sticky.iter() {
+                found = true;
+                s.entry_el.ref_remove();
+            }
+            self1.early_sticky.clear();
+            for s in self1.late_sticky.iter() {
+                found = true;
+                s.entry_el.ref_remove();
+            }
+            self1.late_sticky.clear();
+        }
+        if found {
+            self.shake();
+        }
     }
 
     pub fn unsticky(&self, id: Id) {

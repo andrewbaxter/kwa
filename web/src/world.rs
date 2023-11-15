@@ -1,10 +1,109 @@
+use chrono::{
+    DateTime,
+    Utc,
+};
 use gloo::utils::window;
 use reqwasm::http::Request;
-use serde::de::DeserializeOwned;
-use crate::model::{
-    U2SPost,
-    U2SGet,
+use serde::{
+    de::DeserializeOwned,
+    Serialize,
+    Deserialize,
 };
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+pub struct IdentityId(pub String);
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+pub struct ChannelId(pub IdentityId, pub u16);
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+pub struct MessageId(pub ChannelId, pub u64);
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+pub struct BrewId(pub usize);
+
+#[derive(Serialize, Deserialize)]
+pub enum U2SPost {
+    Auth {
+        username: String,
+        password: String,
+    },
+    ChannelCreate {
+        name: String,
+    },
+    ChannelJoin {
+        name: String,
+        id: ChannelId,
+    },
+    Send {
+        channel: ChannelId,
+        reply: Option<MessageId>,
+        local_id: String,
+        body: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum U2SGet {
+    GetBrew(BrewId),
+    GetChannel(ChannelId),
+    GetIdentity(IdentityId),
+    GetChannels,
+    GetBrews,
+    GetOwnIdentities,
+    GetAround {
+        channel: ChannelId,
+        time: DateTime<Utc>,
+        count: u64,
+    },
+    GetBefore {
+        id: MessageId,
+        count: u64,
+    },
+    GetAfter {
+        id: MessageId,
+        count: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UChannel {
+    pub id: ChannelId,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UBrew {
+    pub id: BrewId,
+    pub name: String,
+    pub channels: Vec<ChannelId>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UMessage {
+    pub id: MessageId,
+    pub time: DateTime<Utc>,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UGetAroundResp {
+    pub entries: Vec<S2UMessage>,
+    pub early_stop: bool,
+    pub late_stop: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UGetBeforeResp {
+    pub entries: Vec<S2UMessage>,
+    pub early_stop: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2UGetAfterResp {
+    pub entries: Vec<S2UMessage>,
+    pub late_stop: bool,
+}
 
 async fn send_req(req: Request) -> Result<Vec<u8>, String> {
     let resp = match req.send().await {
@@ -44,6 +143,16 @@ impl World {
 
     pub async fn req_get<T: DeserializeOwned>(&self, req: U2SGet) -> Result<T, String> {
         let res = send_req(Request::get(&req_get_url(&self.origin, req))).await?;
+        return Ok(serde_json::from_slice(&res).map_err(|e| e.to_string())?);
+    }
+
+    pub async fn req_post_ret<T: DeserializeOwned>(&self, req: U2SPost) -> Result<T, String> {
+        let res =
+            send_req(
+                Request::post(&format!("{}/api", &self.origin))
+                    .header("Content-type", "application/json")
+                    .body(serde_json::to_string(&req).unwrap()),
+            ).await?;
         return Ok(serde_json::from_slice(&res).map_err(|e| e.to_string())?);
     }
 
