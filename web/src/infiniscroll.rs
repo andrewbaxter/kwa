@@ -91,7 +91,6 @@ use std::{
     collections::{
         HashMap,
         VecDeque,
-        HashSet,
     },
     hash::Hash,
 };
@@ -104,6 +103,10 @@ use gloo::{
     timers::callback::{
         Timeout,
     },
+};
+use lunk::{
+    ProcessingContext,
+    EventGraph,
 };
 use rooting::{
     el,
@@ -130,10 +133,9 @@ use crate::{
 const PX_PER_CM: f64 = 96. / 2.54;
 const BUFFER: f64 = PX_PER_CM * 40.;
 const CSS_HIDE: &'static str = "hide";
-const REQUEST_COUNT: usize = 50;
+pub const REQUEST_COUNT: usize = 50;
 const MIN_RESERVE: usize = 50;
 const MAX_RESERVE: usize = MIN_RESERVE + 2 * REQUEST_COUNT;
-pub type FeedId = usize;
 
 trait ElExt {
     fn offset_top(&self) -> f64;
@@ -150,24 +152,28 @@ impl ElExt for El {
     }
 }
 
-pub trait IdTraits: Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash { }
+pub trait TimeTraits: 'static + Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash { }
 
-impl<T: Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash> IdTraits for T { }
+impl<T: 'static + Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash> TimeTraits for T { }
+
+pub trait FeedIdTraits: 'static + Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash { }
+
+impl<T: 'static + Clone + std::fmt::Debug + PartialEq + Eq + PartialOrd + Hash> FeedIdTraits for T { }
 
 /// Represents an atom in the infinite scroller.
 pub trait Entry<Id> {
-    fn create_el(&self) -> El;
+    fn create_el(&self, pc: &mut ProcessingContext) -> El;
     fn time(&self) -> Id;
 }
 
-struct EntryState<Id> {
+struct EntryState<FeedId, Id> {
     feed_id: FeedId,
     entry: Rc<dyn Entry<Id>>,
     entry_el: El,
     _entry_el_observe: ObserveHandle,
 }
 
-impl<Id> ContainerEntry for EntryState<Id> {
+impl<FeedId, Id> ContainerEntry for EntryState<FeedId, Id> {
     fn el(&self) -> &El {
         return &self.entry_el;
     }
@@ -179,30 +185,30 @@ impl<Id> ContainerEntry for EntryState<Id> {
 ///
 /// The stop states of the feed are controlled by the feed when it calls `respond_`
 /// methods.
-pub trait Feed<Id: IdTraits> {
-    fn set_parent(&self, parent: WeakInfiniscroll<Id>, id_in_parent: FeedId);
-    fn request_around(&self, time: Id, count: usize);
-    fn request_before(&self, time: Id, count: usize);
-    fn request_after(&self, time: Id, count: usize);
+pub trait Feed<FeedId, Time: TimeTraits> {
+    fn set_parent(&self, parent: WeakInfiniscroll<FeedId, Time>);
+    fn request_around(&self, pc: &mut ProcessingContext, time: Time, count: usize);
+    fn request_before(&self, pc: &mut ProcessingContext, time: Time, count: usize);
+    fn request_after(&self, pc: &mut ProcessingContext, time: Time, count: usize);
 }
 
-struct FeedState<Id> {
-    feed: Box<dyn Feed<Id>>,
+struct FeedState<FeedId, Time> {
+    feed: Box<dyn Feed<FeedId, Time>>,
     /// No elements, shortcut for request_around for initial data
     initial: bool,
     /// All entries are sorted and come before all realized entries. Front = nearest to
     /// real = late to early.
-    early_reserve: VecDeque<Rc<dyn Entry<Id>>>,
+    early_reserve: VecDeque<Rc<dyn Entry<Time>>>,
     /// All entries are sorted and come after all realized entries. Front = nearest to
     /// real = early to late.
-    late_reserve: VecDeque<Rc<dyn Entry<Id>>>,
+    late_reserve: VecDeque<Rc<dyn Entry<Time>>>,
     early_stop: bool,
     late_stop: bool,
-    latest_known: Option<Id>,
-    earliest_known: Option<Id>,
+    latest_known: Option<Time>,
+    earliest_known: Option<Time>,
 }
 
-impl<Id: IdTraits> FeedState<Id> {
+impl<FeedId, Id: TimeTraits> FeedState<FeedId, Id> {
     fn update_earliest_known(&mut self, time: Id) {
         match &self.earliest_known {
             Some(i) => if time < *i {
@@ -227,9 +233,10 @@ impl<Id: IdTraits> FeedState<Id> {
     }
 }
 
-struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
+struct Infiniscroll_<FeedId, Time: Clone + Hash + PartialEq> {
+    eg: EventGraph,
     /// Used when new/resetting
-    reset_time: Id,
+    reset_time: Time,
     outer_stack: El,
     frame: El,
     cached_frame_height: f64,
@@ -242,22 +249,13 @@ struct Infiniscroll_<Id: Clone + Hash + PartialEq> {
     center_spinner: El,
     early_spinner: El,
     late_spinner: El,
-    feeds: HashMap<FeedId, FeedState<Id>>,
-    sticky_set: HashSet<Id>,
-    /// Duplicate elements in early reserve, where the sticky element is still part of
-    /// the dom.  When an element is put in real, remove from here. However a discarded
-    /// sticky reserve element stays here.
-    ///
-    /// Back = nearest to real.
-    early_sticky: Container<EntryState<Id>>,
-    /// Duplicate elements in late reserve, where the sticky element is still part of
-    /// the dom.  When an element is put in real, remove from here. However a discarded
-    /// sticky reserve element stays here.
-    ///
-    /// Back = nearest to real.
-    late_sticky: Container<EntryState<Id>>,
+    feeds: HashMap<FeedId, FeedState<FeedId, Time>>,
+    want_sticky: Option<Time>,
+    reserve_sticky_entry: Option<EntryState<FeedId, Time>>,
+    early_sticky: El,
+    late_sticky: El,
     /// All entries are sorted.
-    real: Container<EntryState<Id>>,
+    real: Container<EntryState<FeedId, Time>>,
     cached_real_offset: f64,
     /// None if real is empty (i.e. invalid index)
     anchor_i: Option<usize>,
@@ -292,7 +290,7 @@ fn calc_anchor_offset(real_origin_y: f64, anchor_top: f64, anchor_height: f64, a
     return anchor_offset;
 }
 
-impl<Id: IdTraits> Infiniscroll_<Id> {
+impl<FeedId, Time: TimeTraits> Infiniscroll_<FeedId, Time> {
     fn reanchor_inner(&mut self, mut anchor_i: usize, real_origin_y: f64) {
         // Move anchor pointer down until directly after desired element
         while let Some(e_state) = self.real.get(anchor_i + 1) {
@@ -452,21 +450,31 @@ impl<Id: IdTraits> Infiniscroll_<Id> {
 }
 
 fn get_pivot_early<
-    Id: Clone,
->(entries: &Container<EntryState<Id>>, feed_id: FeedId, f_state: &FeedState<Id>) -> Option<Id> {
+    FeedId: FeedIdTraits,
+    Time: Clone,
+>(
+    entries: &Container<EntryState<FeedId, Time>>,
+    feed_id: &FeedId,
+    f_state: &FeedState<FeedId, Time>,
+) -> Option<Time> {
     return f_state
         .early_reserve
         .back()
         .map(|entry| entry.time())
         .or_else(
-            || entries.iter().filter(|entry| entry.feed_id == feed_id).map(|e_state| e_state.entry.time()).next(),
+            || entries.iter().filter(|entry| &entry.feed_id == feed_id).map(|e_state| e_state.entry.time()).next(),
         )
         .or_else(|| f_state.late_reserve.front().map(|entry| entry.time()));
 }
 
 fn get_pivot_late<
-    Id: Clone,
->(entries: &Container<EntryState<Id>>, feed_id: FeedId, f_state: &FeedState<Id>) -> Option<Id> {
+    FeedId: FeedIdTraits,
+    Time: Clone,
+>(
+    entries: &Container<EntryState<FeedId, Time>>,
+    feed_id: &FeedId,
+    f_state: &FeedState<FeedId, Time>,
+) -> Option<Time> {
     return f_state
         .late_reserve
         .back()
@@ -475,7 +483,7 @@ fn get_pivot_late<
             || entries
                 .iter()
                 .rev()
-                .filter(|entry| entry.feed_id == feed_id)
+                .filter(|entry| &entry.feed_id == feed_id)
                 .map(|e_state| e_state.entry.time())
                 .next(),
         )
@@ -483,11 +491,17 @@ fn get_pivot_late<
 }
 
 fn realize_entry<
-    Id: Clone,
->(entry_resize_observer: &ResizeObserver, feed_id: FeedId, entry: Rc<dyn Entry<Id>>) -> EntryState<Id> {
-    let entry_el = entry.create_el();
+    FeedId: FeedIdTraits,
+    Time: Clone,
+>(
+    pc: &mut ProcessingContext,
+    entry_resize_observer: &ResizeObserver,
+    feed_id: &FeedId,
+    entry: Rc<dyn Entry<Time>>,
+) -> EntryState<FeedId, Time> {
+    let entry_el = entry.create_el(pc);
     return EntryState {
-        feed_id: feed_id,
+        feed_id: feed_id.clone(),
         entry: entry,
         entry_el: entry_el.clone(),
         _entry_el_observe: entry_resize_observer.observe(&entry_el),
@@ -495,26 +509,26 @@ fn realize_entry<
 }
 
 #[derive(Clone)]
-pub struct WeakInfiniscroll<Id: IdTraits>(Weak<RefCell<Infiniscroll_<Id>>>);
+pub struct WeakInfiniscroll<FeedId, Id: TimeTraits>(Weak<RefCell<Infiniscroll_<FeedId, Id>>>);
 
-impl<Id: IdTraits> WeakInfiniscroll<Id> {
-    pub fn upgrade(&self) -> Option<Infiniscroll<Id>> {
+impl<FeedId: FeedIdTraits, Id: TimeTraits> WeakInfiniscroll<FeedId, Id> {
+    pub fn upgrade(&self) -> Option<Infiniscroll<FeedId, Id>> {
         return self.0.upgrade().map(Infiniscroll);
     }
 }
 
 #[derive(Clone)]
-pub struct Infiniscroll<Id: IdTraits>(Rc<RefCell<Infiniscroll_<Id>>>);
+pub struct Infiniscroll<FeedId: FeedIdTraits, Id: TimeTraits>(Rc<RefCell<Infiniscroll_<FeedId, Id>>>);
 
-impl<Id: IdTraits + 'static> Infiniscroll<Id> {
-    pub fn new(reset_id: Id, feeds: Vec<Box<dyn Feed<Id>>>) -> Self {
+impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, TimeT> {
+    pub fn new(eg: EventGraph, reset_id: TimeT, feeds: HashMap<FeedIdT, Box<dyn Feed<FeedIdT, TimeT>>>) -> Self {
         let outer_stack = stack().classes(&["infinite"]);
         let frame = el("div").classes(&["frame"]);
         let content = el("div").classes(&["content"]);
         let content_layout = el("div").classes(&["content_layout"]);
-        let content_lines_early_sticky = Container::new(el("div").classes(&["sticky"]));
+        let content_lines_early_sticky = el("div").classes(&["sticky"]);
         let content_lines_real = Container::new(el("div").classes(&["real"]));
-        let content_lines_late_sticky = Container::new(el("div").classes(&["sticky"]));
+        let content_lines_late_sticky = el("div").classes(&["sticky"]);
         let center_spinner = el("div").classes(&["center_spinner"]);
         let early_spinner = el("div").classes(&["early_spinner", CSS_HIDE]);
         let late_spinner = el("div").classes(&["late_spinner", CSS_HIDE]);
@@ -524,13 +538,14 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         content_layout.ref_extend(
             vec![
                 early_spinner.clone(),
-                content_lines_early_sticky.el().clone(),
+                content_lines_early_sticky.clone(),
                 content_lines_real.el().clone(),
-                content_lines_late_sticky.el().clone(),
+                content_lines_late_sticky.clone(),
                 late_spinner.clone()
             ],
         );
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
+            eg: eg,
             reset_time: reset_id,
             outer_stack: outer_stack,
             frame: frame.clone(),
@@ -544,11 +559,12 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             early_spinner: early_spinner,
             late_spinner: late_spinner,
             feeds: HashMap::new(),
-            sticky_set: HashSet::new(),
+            want_sticky: None,
+            reserve_sticky_entry: None,
             early_sticky: content_lines_early_sticky,
+            late_sticky: content_lines_late_sticky,
             real: content_lines_real,
             cached_real_offset: 0.,
-            late_sticky: content_lines_late_sticky,
             anchor_i: None,
             anchor_alignment: 0.5,
             anchor_offset: 0.,
@@ -574,9 +590,9 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         {
             let mut state1 = state.0.borrow_mut();
             let weak_state = state.weak();
-            for (i, feed) in feeds.into_iter().enumerate() {
-                feed.set_parent(weak_state.clone(), i);
-                state1.feeds.insert(i, FeedState {
+            for (feed_id, feed) in feeds.into_iter() {
+                feed.set_parent(weak_state.clone());
+                state1.feeds.insert(feed_id, FeedState {
                     feed: feed,
                     initial: true,
                     early_reserve: VecDeque::new(),
@@ -659,7 +675,7 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         return state;
     }
 
-    pub fn weak(&self) -> WeakInfiniscroll<Id> {
+    pub fn weak(&self) -> WeakInfiniscroll<FeedIdT, TimeT> {
         return WeakInfiniscroll(Rc::downgrade(&self.0));
     }
 
@@ -693,46 +709,39 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             .unwrap();
     }
 
-    pub fn jump(&self, time: Id) {
+    pub fn set_sticky(&self, time: &TimeT) {
+        let mut changed = false;
+
         bb!{
             'done _;
             let mut self1 = self.0.borrow_mut();
-            let after = bb!{
-                'found _;
-                for (i, e) in self1.real.iter().enumerate() {
-                    let e_time = e.entry.time();
-                    if e_time == time {
-                        self1.anchor_i = Some(i);
-                        self1.anchor_alignment = 0.5;
-                        self1.anchor_offset = 0.;
-                        break 'done;
-                    }
-                    if e_time > time {
-                        break 'found Some(i);
+            if let Some(have_time) = &self1.want_sticky {
+                if have_time == time {
+                    // No change
+                    break 'done;
+                } else {
+                    // Changed; clean up old sticky entry
+                    if let Some(f) = &self1.reserve_sticky_entry {
+                        changed = true;
+                        f.entry_el.ref_remove();
                     }
                 }
-                break 'found None;
-            };
-            match after {
-                // After end
-                None => (),
-                // Before start
-                Some(0) => (),
-                // Middle
-                Some(i) => {
-                    self1.anchor_i = Some(i);
-                    self1.anchor_alignment = 0.5;
-                    self1.anchor_offset = 0.;
-                    break 'done;
-                },
             }
-            self1.reset_time = time;
+            self1.want_sticky = Some(time.clone());
+            // Locate rendered
+            for e in self1.real.iter() {
+                if &e.entry.time() == time {
+                    // Element exists, must be marked sticky but otherwise all good
+                    break 'done;
+                }
+            }
+            // Not rendered; clear and jump
+            changed = true;
+            self1.reset_time = time.clone();
             self1.real.clear();
             self1.anchor_i = None;
             self1.anchor_alignment = 0.5;
             self1.anchor_offset = 0.;
-            self1.early_sticky.clear();
-            self1.late_sticky.clear();
             for f in self1.feeds.values_mut() {
                 f.early_reserve.clear();
                 f.late_reserve.clear();
@@ -744,116 +753,23 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
             }
         }
 
-        self.shake_immediate();
-    }
-
-    pub fn sticky(&self, feed_id: FeedId, id: Id) {
-        {
-            let mut self1 = self.0.borrow_mut();
-            let self1 = &mut *self1;
-            self1.sticky_set.insert(id.clone());
-            let feed = self1.feeds.get_mut(&feed_id).unwrap();
-            for e in &self1.early_sticky {
-                if e.entry.time() == id {
-                    return;
-                }
-            }
-            for e in &self1.late_sticky {
-                if e.entry.time() == id {
-                    return;
-                }
-            }
-            for e in feed.early_reserve.iter().rev() {
-                let e_time = e.time();
-                if e_time == id {
-                    let e_state = realize_entry(&self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    let mut insert_before = 0;
-                    for (i, e) in self1.early_sticky.iter().enumerate() {
-                        if id < e.entry.time() {
-                            insert_before = i;
-                            break;
-                        }
-                    }
-                    self1.early_sticky.splice(insert_before, 0, vec![e_state]);
-                    return;
-                }
-            }
-            for e in feed.late_reserve.iter().rev() {
-                let e_time = e.time();
-                if e_time == id {
-                    let e_state = realize_entry(&self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    let mut insert_before = self1.late_sticky.len();
-                    for (i, e) in self1.late_sticky.iter().enumerate() {
-                        if id < e.entry.time() {
-                            insert_before = i;
-                            break;
-                        }
-                    }
-                    self1.late_sticky.splice(insert_before, 0, vec![e_state]);
-                    return;
-                }
-            }
+        if changed {
+            self.shake_immediate();
         }
-        self.shake();
     }
 
     pub fn clear_sticky(&self) {
-        let mut found = false;
+        let mut changed = false;
         {
             let mut self1 = self.0.borrow_mut();
             let self1 = &mut *self1;
-            self1.sticky_set.clear();
-            for s in self1.early_sticky.iter() {
-                found = true;
+            self1.want_sticky = None;
+            if let Some(s) = self1.reserve_sticky_entry.take() {
+                changed = true;
                 s.entry_el.ref_remove();
             }
-            self1.early_sticky.clear();
-            for s in self1.late_sticky.iter() {
-                found = true;
-                s.entry_el.ref_remove();
-            }
-            self1.late_sticky.clear();
         }
-        if found {
-            self.shake();
-        }
-    }
-
-    pub fn unsticky(&self, id: Id) {
-        let mut found = false;
-        {
-            let mut self1 = self.0.borrow_mut();
-            let self1 = &mut *self1;
-            self1.sticky_set.remove(&id);
-            {
-                let mut found_early = None;
-                for (i, e) in self1.early_sticky.iter().enumerate() {
-                    if e.entry.time() != id {
-                        continue;
-                    }
-                    found_early = Some(i);
-                    break;
-                }
-                if let Some(i) = found_early {
-                    self1.early_sticky.remove(i);
-                    found = true;
-                }
-            }
-            {
-                let mut found_late = None;
-                for (i, e) in self1.late_sticky.iter().enumerate() {
-                    if e.entry.time() != id {
-                        continue;
-                    }
-                    found_late = Some(i);
-                }
-                if let Some(i) = found_late {
-                    self1.late_sticky.remove(i);
-                    found = true;
-                }
-            }
-        }
-        if found {
+        if changed {
             self.shake();
         }
     }
@@ -862,372 +778,375 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         logd!("shake immediate ------------");
         let mut self1 = self.0.borrow_mut();
         let self1 = &mut *self1;
-        self1.delay_shake = 0;
-        self1.shake_future = None;
+        let eg = self1.eg.clone();
+        eg.event(|pc| {
+            self1.delay_shake = 0;
+            self1.shake_future = None;
 
-        // # Calculate content + current theoretical used space
-        let mut used_early = 0f64;
-        let mut used_late = 0f64;
-        let mut real_origin_y = 0f64;
-        if !self1.real.is_empty() {
-            let real_height = self1.real.el().offset_height();
-            let anchor_i = self1.anchor_i.unwrap();
-            let anchor = &mut self1.real.get(anchor_i).unwrap();
-            let anchor_top = anchor.entry_el.offset_top();
-            let anchor_height = anchor.entry_el.offset_height();
-            real_origin_y = anchor_top + anchor_height * self1.anchor_alignment
-                // Shift up becomes early usage
-                - self1.anchor_offset;
-            used_early = real_origin_y;
-            used_late = real_height - real_origin_y;
-        }
-        logn!("shake imm, used early {}, late {}", used_early, used_late);
-
-        // # Realize and unrealize elements to match goal bounds
-        //
-        // ## Early...
-        let want_nostop_early = BUFFER + self1.cached_frame_height * self1.anchor_alignment;
-        let mut unrealize_early = 0usize;
-        for e in &self1.real {
-            let bottom = e.entry_el.offset_top() + e.entry_el.offset_height();
-            let min_dist = real_origin_y - bottom;
-            if min_dist <= want_nostop_early {
-                break;
+            // # Calculate content + current theoretical used space
+            let mut used_early = 0f64;
+            let mut used_late = 0f64;
+            let mut real_origin_y = 0f64;
+            if !self1.real.is_empty() {
+                let real_height = self1.real.el().offset_height();
+                let anchor_i = self1.anchor_i.unwrap();
+                let anchor = &mut self1.real.get(anchor_i).unwrap();
+                let anchor_top = anchor.entry_el.offset_top();
+                let anchor_height = anchor.entry_el.offset_height();
+                real_origin_y = anchor_top + anchor_height * self1.anchor_alignment
+                    // Shift up becomes early usage
+                    - self1.anchor_offset;
+                used_early = real_origin_y;
+                used_late = real_height - real_origin_y;
             }
-            logn!("unrealize; bottom {} vs want early {}", min_dist, want_nostop_early);
-            unrealize_early += 1;
-            used_early = real_origin_y - bottom;
-        }
-        let mut stop_all_early = true;
-        let mut realized_early = vec![];
+            logn!("shake imm, used early {}, late {}", used_early, used_late);
 
-        bb!{
-            'realize_early _;
-            while used_early < want_nostop_early {
-                let mut use_feed = None;
-                for (feed_id, f_state) in &self1.feeds {
-                    let Some(entry) = f_state.early_reserve.front() else {
-                        // Reserve empty
-                        if f_state.early_stop {
-                            continue;
-                        } else {
-                            // Pending more
-                            stop_all_early = false;
-                            break 'realize_early;
+            // # Realize and unrealize elements to match goal bounds
+            //
+            // ## Early...
+            let want_nostop_early = BUFFER + self1.cached_frame_height * self1.anchor_alignment;
+            let mut unrealize_early = 0usize;
+            for e in &self1.real {
+                let bottom = e.entry_el.offset_top() + e.entry_el.offset_height();
+                let min_dist = real_origin_y - bottom;
+                if min_dist <= want_nostop_early {
+                    break;
+                }
+                logn!("unrealize; bottom {} vs want early {}", min_dist, want_nostop_early);
+                unrealize_early += 1;
+                used_early = real_origin_y - bottom;
+            }
+            let mut stop_all_early = true;
+            let mut realized_early = vec![];
+
+            bb!{
+                'realize_early _;
+                while used_early < want_nostop_early {
+                    let mut use_feed = None;
+                    for (feed_id, f_state) in &self1.feeds {
+                        let Some(entry) = f_state.early_reserve.front() else {
+                            // Reserve empty
+                            if f_state.early_stop {
+                                continue;
+                            } else {
+                                // Pending more
+                                stop_all_early = false;
+                                break 'realize_early;
+                            }
+                        };
+                        let replace = match &use_feed {
+                            Some((_, time)) => {
+                                entry.time() > *time
+                            },
+                            None => {
+                                true
+                            },
+                        };
+                        if replace {
+                            use_feed = Some((feed_id.clone(), entry.time()));
                         }
-                    };
-                    let replace = match &use_feed {
-                        Some((_, time)) => {
-                            entry.time() > *time
-                        },
-                        None => {
-                            true
-                        },
-                    };
-                    if replace {
-                        use_feed = Some((feed_id.clone(), entry.time()));
                     }
-                }
-                let Some((feed_id, _)) = use_feed else {
-                    break 'realize_early;
-                };
-                let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                let entry = feed.early_reserve.pop_front().unwrap();
-                let mut real = None;
-                if let Some(f) = self1.early_sticky.last() {
-                    if f.entry.time() == entry.time() {
-                        let real1 = self1.early_sticky.pop().unwrap();
-                        real1.entry_el.ref_remove();
-                        real = Some(real1);
-                    }
-                }
-                let real =
-                    real.unwrap_or_else(
-                        || realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry),
-                    );
-                self1.real.el().ref_push(real.entry_el.clone());
-                let height = real.entry_el.offset_height();
-                real.entry_el.ref_remove();
-                used_early += height;
-                logn!("realize pre; id {:?}; height {} -> {}", real.entry.time(), height, used_early);
-                realized_early.push(real);
-            }
-            stop_all_early = false;
-        };
-
-        // ## Late...
-        let want_nostop_late = BUFFER + self1.cached_frame_height * (1. - self1.anchor_alignment);
-        let mut unrealize_late = 0usize;
-        for e in self1.real.iter().rev() {
-            let top = e.entry_el.offset_top();
-            let min_dist = top - real_origin_y;
-            if min_dist <= want_nostop_late {
-                break;
-            }
-            unrealize_late += 1;
-            used_late = top - real_origin_y;
-        }
-        let mut stop_all_late = true;
-        let mut realized_late = vec![];
-
-        bb!{
-            'realize_late _;
-            while used_late < want_nostop_late {
-                let mut use_feed = None;
-                for (feed_id, f_state) in &self1.feeds {
-                    let Some(entry) = f_state.late_reserve.front() else {
-                        // Reserve empty
-                        if f_state.late_stop {
-                            continue;
-                        } else {
-                            // Pending more
-                            stop_all_late = false;
-                            break 'realize_late;
+                    let Some((feed_id, _)) = use_feed else {
+                        break 'realize_early;
+                    };
+                    let feed = self1.feeds.get_mut(&feed_id).unwrap();
+                    let entry = feed.early_reserve.pop_front().unwrap();
+                    let mut real = None;
+                    if let Some(f) = &self1.reserve_sticky_entry {
+                        if f.entry.time() == entry.time() {
+                            let real1 = self1.reserve_sticky_entry.take().unwrap();
+                            real1.entry_el.ref_remove();
+                            real = Some(real1);
                         }
-                    };
-                    let replace = match &use_feed {
-                        Some((_, time)) => {
-                            entry.time() < *time
-                        },
-                        None => {
-                            true
-                        },
-                    };
-                    if replace {
-                        use_feed = Some((feed_id.clone(), entry.time()));
                     }
+                    let real =
+                        real.unwrap_or_else(
+                            || realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), &feed_id, entry),
+                        );
+                    self1.real.el().ref_push(real.entry_el.clone());
+                    let height = real.entry_el.offset_height();
+                    real.entry_el.ref_remove();
+                    used_early += height;
+                    logn!("realize pre; id {:?}; height {} -> {}", real.entry.time(), height, used_early);
+                    realized_early.push(real);
                 }
-                let Some((feed_id, _)) = use_feed else {
-                    break 'realize_late;
-                };
-                let feed = self1.feeds.get_mut(&feed_id).unwrap();
-                let entry = feed.late_reserve.pop_front().unwrap();
-                let mut real = None;
-                if let Some(f) = self1.late_sticky.first() {
-                    if f.entry.time() == entry.time() {
-                        let real1 = self1.late_sticky.remove(0);
-                        real1.entry_el.ref_remove();
-                        real = Some(real1);
+                stop_all_early = false;
+            };
+
+            // ## Late...
+            let want_nostop_late = BUFFER + self1.cached_frame_height * (1. - self1.anchor_alignment);
+            let mut unrealize_late = 0usize;
+            for e in self1.real.iter().rev() {
+                let top = e.entry_el.offset_top();
+                let min_dist = top - real_origin_y;
+                if min_dist <= want_nostop_late {
+                    break;
+                }
+                unrealize_late += 1;
+                used_late = top - real_origin_y;
+            }
+            let mut stop_all_late = true;
+            let mut realized_late = vec![];
+
+            bb!{
+                'realize_late _;
+                while used_late < want_nostop_late {
+                    let mut use_feed = None;
+                    for (feed_id, f_state) in &self1.feeds {
+                        let Some(entry) = f_state.late_reserve.front() else {
+                            // Reserve empty
+                            if f_state.late_stop {
+                                continue;
+                            } else {
+                                // Pending more
+                                stop_all_late = false;
+                                break 'realize_late;
+                            }
+                        };
+                        let replace = match &use_feed {
+                            Some((_, time)) => {
+                                entry.time() < *time
+                            },
+                            None => {
+                                true
+                            },
+                        };
+                        if replace {
+                            use_feed = Some((feed_id.clone(), entry.time()));
+                        }
                     }
+                    let Some((feed_id, _)) = use_feed else {
+                        break 'realize_late;
+                    };
+                    let feed = self1.feeds.get_mut(&feed_id).unwrap();
+                    let entry = feed.late_reserve.pop_front().unwrap();
+                    let mut real = None;
+                    if let Some(f) = &self1.reserve_sticky_entry {
+                        if f.entry.time() == entry.time() {
+                            let real1 = self1.reserve_sticky_entry.take().unwrap();
+                            real1.entry_el.ref_remove();
+                            real = Some(real1);
+                        }
+                    }
+                    let real =
+                        real.unwrap_or_else(
+                            || realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), &feed_id, entry),
+                        );
+                    self1.content.ref_push(real.entry_el.clone());
+                    let height = real.entry_el.offset_height();
+                    real.entry_el.ref_remove();
+                    used_late += height;
+                    logn!("realize post; id {:?}; height {} -> {}", real.entry.time(), height, used_late);
+                    realized_late.push(real);
                 }
-                let real =
-                    real.unwrap_or_else(
-                        || realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry),
-                    );
-                self1.content.ref_push(real.entry_el.clone());
-                let height = real.entry_el.offset_height();
-                real.entry_el.ref_remove();
-                used_late += height;
-                logn!("realize post; id {:?}; height {} -> {}", real.entry.time(), height, used_late);
-                realized_late.push(real);
-            }
-            stop_all_late = false;
-        };
+                stop_all_late = false;
+            };
 
-        // ## Apply changes
-        //
-        // ### Update anchor
-        match self1.anchor_i {
-            Some(anchor_i) => {
-                logn!("prepend; shift anchor {} +{} -{}", anchor_i, realized_early.len(), unrealize_early);
-                self1.anchor_i = Some(anchor_i + realized_early.len() - unrealize_early);
-            },
-            None => {
-                match (realized_early.is_empty(), realized_late.is_empty()) {
-                    (true, true) => {
-                        // nop
-                    },
-                    (true, false) => {
-                        logn!("prepend; reset anchor i -> {:?} (first)", realized_early.len());
-                        self1.anchor_i = Some(0);
-                    },
-                    (false, _) => {
-                        logn!("prepend; reset anchor i -> {:?} (last)", realized_early.len() - 1);
-                        self1.anchor_i = Some(realized_early.len() - 1);
-                    },
+            // ## Apply changes
+            //
+            // ### Update anchor
+            match self1.anchor_i {
+                Some(anchor_i) => {
+                    logn!("prepend; shift anchor {} +{} -{}", anchor_i, realized_early.len(), unrealize_early);
+                    self1.anchor_i = Some(anchor_i + realized_early.len() - unrealize_early);
+                },
+                None => {
+                    match (realized_early.is_empty(), realized_late.is_empty()) {
+                        (true, true) => {
+                            // nop
+                        },
+                        (true, false) => {
+                            logn!("prepend; reset anchor i -> {:?} (first)", realized_early.len());
+                            self1.anchor_i = Some(0);
+                        },
+                        (false, _) => {
+                            logn!("prepend; reset anchor i -> {:?} (last)", realized_early.len() - 1);
+                            self1.anchor_i = Some(realized_early.len() - 1);
+                        },
+                    }
+                },
+            }
+
+            // ### New early elements
+            //
+            // late to early -> early to late
+            realized_early.reverse();
+            for evicted_e_state in self1.real.splice(0, unrealize_early, realized_early) {
+                let feed = self1.feeds.get_mut(&evicted_e_state.feed_id).unwrap();
+                feed.early_reserve.push_front(evicted_e_state.entry.clone());
+                if self1.want_sticky.iter().any(|s| s == &evicted_e_state.entry.time()) {
+                    self1.early_sticky.ref_push(evicted_e_state.el().clone());
+                    self1.reserve_sticky_entry = Some(evicted_e_state);
                 }
-            },
-        }
-
-        // ### Early elements
-        //
-        // late to early -> early to late
-        realized_early.reverse();
-        for e_state in self1.real.splice(0, unrealize_early, realized_early) {
-            let feed = self1.feeds.get_mut(&e_state.feed_id).unwrap();
-            feed.early_reserve.push_front(e_state.entry.clone());
-            if self1.sticky_set.contains(&e_state.entry.time()) {
-                self1.early_sticky.push(e_state);
             }
-        }
 
-        // ### Late elements
-        let mut late_prepend_sticky = vec![];
-        for e_state in self1.real.splice(self1.real.len() - unrealize_late, unrealize_late, realized_late).rev() {
-            let feed = self1.feeds.get_mut(&e_state.feed_id).unwrap();
-            feed.late_reserve.push_front(e_state.entry.clone());
-            if self1.sticky_set.contains(&e_state.entry.time()) {
-                late_prepend_sticky.push(e_state);
-            }
-        }
-        self1.late_sticky.splice(0, 0, late_prepend_sticky);
-        if let Some(anchor_i) = &self1.anchor_i {
-            let anchor = self1.real.get(*anchor_i).unwrap();
-            logn!(
-                "anchor origin now (content layout) i {}, {} + {} * {} - {} = {}",
-                anchor_i,
-                anchor.entry_el.offset_top(),
-                anchor.entry_el.offset_height(),
-                self1.anchor_alignment,
-                self1.anchor_offset,
-                anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self1.anchor_alignment -
-                    self1.anchor_offset
-            );
-        }
-
-        // # Prune reserve and unset stop status
-        let mut requesting_early = false;
-        let mut requesting_late = false;
-        for (feed_id, f_state) in &mut self1.feeds {
-            if f_state.initial {
-                f_state.feed.request_around(self1.reset_time.clone(), REQUEST_COUNT);
-                requesting_early = true;
-                requesting_late = true;
-            } else {
-                if f_state.early_reserve.len() > MAX_RESERVE {
-                    f_state.early_reserve.truncate(MAX_RESERVE);
-                    f_state.early_stop = false;
+            // ### Late elements
+            for evicted_e_state in self1.real.splice(self1.real.len() - unrealize_late, unrealize_late, realized_late).rev() {
+                let feed = self1.feeds.get_mut(&evicted_e_state.feed_id).unwrap();
+                feed.late_reserve.push_front(evicted_e_state.entry.clone());
+                if self1.want_sticky.iter().any(|s| s == &evicted_e_state.entry.time()) {
+                    self1.late_sticky.ref_push(evicted_e_state.el().clone());
+                    self1.reserve_sticky_entry = Some(evicted_e_state);
                 }
-                if !f_state.early_stop && f_state.early_reserve.len() < MIN_RESERVE {
-                    let pivot = get_pivot_early(&self1.real, *feed_id, f_state).unwrap();
-                    logn!("request early (pivot {:?})", pivot);
-                    f_state.feed.request_before(pivot, REQUEST_COUNT);
+            }
+            if let Some(anchor_i) = &self1.anchor_i {
+                let anchor = self1.real.get(*anchor_i).unwrap();
+                logn!(
+                    "anchor origin now (content layout) i {}, {} + {} * {} - {} = {}",
+                    anchor_i,
+                    anchor.entry_el.offset_top(),
+                    anchor.entry_el.offset_height(),
+                    self1.anchor_alignment,
+                    self1.anchor_offset,
+                    anchor.entry_el.offset_top() + anchor.entry_el.offset_height() * self1.anchor_alignment -
+                        self1.anchor_offset
+                );
+            }
+
+            // # Prune reserve and unset stop status
+            let mut requesting_early = false;
+            let mut requesting_late = false;
+            for (feed_id, f_state) in &mut self1.feeds {
+                if f_state.initial {
+                    f_state.feed.request_around(pc, self1.reset_time.clone(), REQUEST_COUNT);
                     requesting_early = true;
-                }
-                if f_state.late_reserve.len() > MAX_RESERVE {
-                    f_state.late_reserve.truncate(MAX_RESERVE);
-                    logd!("unset late stop, trunc reserve over max");
-                    f_state.late_stop = false;
-                }
-                if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
-                    let pivot = get_pivot_late(&self1.real, *feed_id, f_state).unwrap();
-                    logn!("request late (pivot {:?})", pivot);
-                    f_state.feed.request_after(pivot, REQUEST_COUNT);
                     requesting_late = true;
+                } else {
+                    if f_state.early_reserve.len() > MAX_RESERVE {
+                        f_state.early_reserve.truncate(MAX_RESERVE);
+                        f_state.early_stop = false;
+                    }
+                    if !f_state.early_stop && f_state.early_reserve.len() < MIN_RESERVE {
+                        let pivot = get_pivot_early(&self1.real, feed_id, f_state).unwrap();
+                        logn!("request early (pivot {:?})", pivot);
+                        f_state.feed.request_before(pc, pivot, REQUEST_COUNT);
+                        requesting_early = true;
+                    }
+                    if f_state.late_reserve.len() > MAX_RESERVE {
+                        f_state.late_reserve.truncate(MAX_RESERVE);
+                        logd!("unset late stop, trunc reserve over max");
+                        f_state.late_stop = false;
+                    }
+                    if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
+                        let pivot = get_pivot_late(&self1.real, feed_id, f_state).unwrap();
+                        logn!("request late (pivot {:?})", pivot);
+                        f_state.feed.request_after(pc, pivot, REQUEST_COUNT);
+                        requesting_late = true;
+                    }
                 }
             }
-        }
-        self1.center_spinner.ref_modify_classes(&[(CSS_HIDE, !(self1.real.is_empty() && requesting_early))]);
-        self1.early_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_early))]);
-        self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_late))]);
-        self1.cached_real_offset = self1.real.el().offset_top();
+            self1.center_spinner.ref_modify_classes(&[(CSS_HIDE, !(self1.real.is_empty() && requesting_early))]);
+            self1.early_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_early))]);
+            self1.late_spinner.ref_modify_classes(&[(CSS_HIDE, !(!self1.real.is_empty() && requesting_late))]);
+            self1.cached_real_offset = self1.real.el().offset_top();
 
-        // # Update alignment based on used space, stop states
-        self1.transition_alignment_reanchor();
+            // # Update alignment based on used space, stop states
+            self1.transition_alignment_reanchor();
 
-        // # Calculate desired space per used space + stop status
-        //
-        // Distance from content-origin to start of content
-        let want_early;
-        if stop_all_early {
-            want_early = used_early.min(want_nostop_early);
-        } else {
-            want_early = want_nostop_early;
-        }
+            // # Calculate desired space per used space + stop status
+            //
+            // Distance from content-origin to start of content
+            let want_early;
+            if stop_all_early {
+                want_early = used_early.min(want_nostop_early);
+            } else {
+                want_early = want_nostop_early;
+            }
 
-        // Distance from content-origin to end of content
-        let want_late;
-        if stop_all_late {
-            want_late = used_late.min(want_nostop_late);
-        } else {
-            want_late = want_nostop_late;
-        }
-        logn!(
-            "stop all early {}, stop all late{}; want early {}, want late {}",
-            stop_all_early,
-            stop_all_late,
-            want_early,
-            want_late
-        );
+            // Distance from content-origin to end of content
+            let want_late;
+            if stop_all_late {
+                want_late = used_late.min(want_nostop_late);
+            } else {
+                want_late = want_nostop_late;
+            }
+            logn!(
+                "stop all early {}, stop all late{}; want early {}, want late {}",
+                stop_all_early,
+                stop_all_late,
+                want_early,
+                want_late
+            );
 
-        // # Update logical height, deferred real height update
-        let new_height = (want_early + want_late).max(self1.cached_frame_height);
-        if (new_height - self1.logical_content_height).abs() >= 1. {
-            logn!("requesting height {} -> {}", self1.logical_content_height, new_height);
-            self1.logical_content_height = new_height;
+            // # Update logical height, deferred real height update
+            let new_height = (want_early + want_late).max(self1.cached_frame_height);
+            if (new_height - self1.logical_content_height).abs() >= 1. {
+                logn!("requesting height {} -> {}", self1.logical_content_height, new_height);
+                self1.logical_content_height = new_height;
+                self1
+                    .content
+                    .raw()
+                    .dyn_ref::<HtmlElement>()
+                    .unwrap()
+                    .style()
+                    .set_property("height", &format!("{}px", new_height))
+                    .unwrap();
+            }
+
+            // # Position content based on content size, used space, and alignment
+            self1.logical_content_layout_offset = self1.anchor_alignment.mix(
+                // Start of content is origin (want_early) minus the amount used before
+                // (used_early)
+                want_early - used_early,
+                // Backwards from end of content, in case used < frame height.
+                // `logical_content_height` is padded, so this will push it to the end.
+                self1.logical_content_height - (want_late + used_early),
+            ) - self1.cached_real_offset;
+            logn!(
+                "content layout top: mix by {} ({} - {} - {} = {}, {} - {} - {} - {} = {}) = {}",
+                self1.anchor_alignment,
+                want_early,
+                used_early,
+                self1.cached_real_offset,
+                want_early - used_early - self1.cached_real_offset,
+                self1.logical_content_height,
+                want_late,
+                used_early,
+                self1.cached_real_offset,
+                self1.logical_content_height - want_late - used_early - self1.cached_real_offset,
+                self1.logical_content_layout_offset
+            );
             self1
-                .content
+                .content_layout
                 .raw()
                 .dyn_ref::<HtmlElement>()
                 .unwrap()
                 .style()
-                .set_property("height", &format!("{}px", new_height))
+                .set_property("top", &format!("{}px", self1.logical_content_layout_offset))
                 .unwrap();
-        }
 
-        // # Position content based on content size, used space, and alignment
-        self1.logical_content_layout_offset = self1.anchor_alignment.mix(
-            // Start of content is origin (want_early) minus the amount used before
-            // (used_early)
-            want_early - used_early,
-            // Backwards from end of content, in case used < frame height.
-            // `logical_content_height` is padded, so this will push it to the end.
-            self1.logical_content_height - (want_late + used_early),
-        ) - self1.cached_real_offset;
-        logn!(
-            "content layout top: mix by {} ({} - {} - {} = {}, {} - {} - {} - {} = {}) = {}",
-            self1.anchor_alignment,
-            want_early,
-            used_early,
-            self1.cached_real_offset,
-            want_early - used_early - self1.cached_real_offset,
-            self1.logical_content_height,
-            want_late,
-            used_early,
-            self1.cached_real_offset,
-            self1.logical_content_height - want_late - used_early - self1.cached_real_offset,
-            self1.logical_content_layout_offset
-        );
-        self1
-            .content_layout
-            .raw()
-            .dyn_ref::<HtmlElement>()
-            .unwrap()
-            .style()
-            .set_property("top", &format!("{}px", self1.logical_content_layout_offset))
-            .unwrap();
-
-        // # Calculate centered scroll so visual origin matches content origin
-        self1.logical_scroll_top =
-            self1
-                .anchor_alignment
-                .mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height)
-                .max(0.);
-        logn!(
-            "update logical scroll: {} - {} / {} from {}.mix({}, {} - {} - {} = {}) = {}; real origin y is {}",
-            // range
-            self1.logical_scroll_top,
-            self1.logical_scroll_top + self1.cached_frame_height,
-            self1.logical_content_height,
-            // mix 0
-            self1.anchor_alignment,
-            // mix 1
-            want_early,
-            // mix 2
-            self1.logical_content_height,
-            want_late,
-            self1.cached_frame_height,
-            self1.logical_content_height - want_late - self1.cached_frame_height,
-            // mix =
-            self1.anchor_alignment.mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height),
-            // origin
-            self1.logical_scroll_top + self1.anchor_alignment.mix(0., self1.cached_frame_height) -
-                self1.logical_content_layout_offset -
-                self1.cached_real_offset
-        );
-        self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
-        self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
-        logd!("shake immediate ------------ done");
+            // # Calculate centered scroll so visual origin matches content origin
+            self1.logical_scroll_top =
+                self1
+                    .anchor_alignment
+                    .mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height)
+                    .max(0.);
+            logn!(
+                "update logical scroll: {} - {} / {} from {}.mix({}, {} - {} - {} = {}) = {}; real origin y is {}",
+                // range
+                self1.logical_scroll_top,
+                self1.logical_scroll_top + self1.cached_frame_height,
+                self1.logical_content_height,
+                // mix 0
+                self1.anchor_alignment,
+                // mix 1
+                want_early,
+                // mix 2
+                self1.logical_content_height,
+                want_late,
+                self1.cached_frame_height,
+                self1.logical_content_height - want_late - self1.cached_frame_height,
+                // mix =
+                self1.anchor_alignment.mix(want_early, self1.logical_content_height - want_late - self1.cached_frame_height),
+                // origin
+                self1.logical_scroll_top + self1.anchor_alignment.mix(0., self1.cached_frame_height) -
+                    self1.logical_content_layout_offset -
+                    self1.cached_real_offset
+            );
+            self1.frame.raw().set_scroll_top(self1.logical_scroll_top.round() as i32);
+            self1.mute_scroll = Utc::now() + Duration::milliseconds(50);
+            logd!("shake immediate ------------ done");
+        });
     }
 
     fn shake(&self) {
@@ -1252,62 +1171,69 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     /// Called by feed, in response to `request__around`.
     pub fn respond_entries_around(
         &self,
-        feed_id: FeedId,
-        pivot: Id,
-        entries: Vec<Rc<dyn Entry<Id>>>,
+        feed_id: FeedIdT,
+        pivot: TimeT,
+        entries: Vec<Rc<dyn Entry<TimeT>>>,
         early_stop: bool,
         late_stop: bool,
     ) {
         {
             let mut self1 = self.0.borrow_mut();
-            let self1 = &mut *self1;
-            if pivot != self1.reset_time {
-                return;
-            }
-            let feed = self1.feeds.get_mut(&feed_id).unwrap();
-            if !feed.initial {
-                return;
-            }
-            feed.initial = false;
+            let eg = self1.eg.clone();
+            eg.event(|pc| {
+                let self1 = &mut *self1;
+                if pivot != self1.reset_time {
+                    return;
+                }
+                let feed = self1.feeds.get_mut(&feed_id).unwrap();
+                if !feed.initial {
+                    return;
+                }
+                feed.initial = false;
 
-            // early to late
-            let mut prepend = vec![];
+                // early to late
+                let mut prepend = vec![];
 
-            // early to late
-            let mut postpend = vec![];
-            for e in entries {
-                let time = e.time();
-                feed.update_earliest_known(time.clone());
-                feed.update_earliest_known(time.clone());
-                if time < self1.reset_time {
-                    prepend.push(e);
-                } else if time == self1.reset_time {
-                    let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e);
-                    logn!("realize initial anchor; id {:?}", real.entry.time());
-                    self1.real.push(real);
-                    self1.anchor_i = Some(0);
-                } else {
-                    postpend.push(e);
+                // early to late
+                let mut postpend = vec![];
+                for e in entries {
+                    let time = e.time();
+                    feed.update_earliest_known(time.clone());
+                    feed.update_earliest_known(time.clone());
+                    if time < self1.reset_time {
+                        prepend.push(e);
+                    } else if time == self1.reset_time {
+                        let real = realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), &feed_id, e);
+                        logn!("realize initial anchor; id {:?}", real.entry.time());
+                        self1.real.push(real);
+                        self1.anchor_i = Some(0);
+                    } else {
+                        postpend.push(e);
+                    }
                 }
-            }
-            for e in &prepend {
-                if self1.sticky_set.contains(&e.time()) {
-                    let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    self1.early_sticky.push(real);
+                for e in &prepend {
+                    if self1.want_sticky.iter().any(|s| s == &e.time()) {
+                        let real =
+                            realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), &feed_id, e.clone());
+                        self1.early_sticky.ref_push(real.el().clone());
+                        self1.reserve_sticky_entry = Some(real);
+                    }
                 }
-            }
-            prepend.reverse();
-            feed.early_reserve.extend(prepend);
-            for e in &postpend {
-                if self1.sticky_set.contains(&e.time()) {
-                    let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    self1.late_sticky.push(real);
+                prepend.reverse();
+                feed.early_reserve.extend(prepend);
+                for e in &postpend {
+                    if self1.want_sticky.iter().any(|s| s == &e.time()) {
+                        let real =
+                            realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), &feed_id, e.clone());
+                        self1.late_sticky.ref_push(real.el().clone());
+                        self1.reserve_sticky_entry = Some(real);
+                    }
                 }
-            }
-            feed.late_reserve.extend(postpend);
-            feed.early_stop = early_stop;
-            feed.late_stop = late_stop;
-            self1.transition_alignment_reanchor();
+                feed.late_reserve.extend(postpend);
+                feed.early_stop = early_stop;
+                feed.late_stop = late_stop;
+                self1.transition_alignment_reanchor();
+            });
         }
         self.shake();
     }
@@ -1322,9 +1248,9 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     ///   entry at the time the request was received.
     pub fn respond_entries_before(
         &self,
-        feed_id: FeedId,
-        initial_pivot: Id,
-        entries: Vec<Rc<dyn Entry<Id>>>,
+        feed_id: &FeedIdT,
+        initial_pivot: &TimeT,
+        entries: Vec<Rc<dyn Entry<TimeT>>>,
         mut stop: bool,
     ) {
         if entries.is_empty() {
@@ -1344,38 +1270,41 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         {
             let mut self1 = self.0.borrow_mut();
             let self1 = &mut *self1;
-            let Some(current_pivot) = get_pivot_early(&self1.real, feed_id, self1.feeds.get(&feed_id).unwrap()) else {
+            let Some(current_pivot) = get_pivot_early(&self1.real, feed_id, self1.feeds.get(feed_id).unwrap()) else {
                 return;
             };
-            if initial_pivot != current_pivot {
+            if initial_pivot != &current_pivot {
                 return;
             }
-            let feed_state = self1.feeds.get_mut(&feed_id).unwrap();
-            {
-                let earliest_known = feed_state.earliest_known.clone().unwrap();
-                if initial_pivot != earliest_known && entries.iter().all(|e| e.time() != earliest_known) {
-                    // Know of element beyond this result (via an async channel)
-                    stop = false;
+            let eg = self1.eg.clone();
+            eg.event(|pc| {
+                let feed_state = self1.feeds.get_mut(feed_id).unwrap();
+                {
+                    let earliest_known = feed_state.earliest_known.clone().unwrap();
+                    if initial_pivot != &earliest_known && entries.iter().all(|e| e.time() != earliest_known) {
+                        // Know of element beyond this result (via an async channel)
+                        stop = false;
+                    }
                 }
-            }
-            logn!(
-                "??? add entries before nostop, pivot {:?}: {:?} -> {:?}",
-                initial_pivot,
-                entries.first().unwrap().time(),
-                entries.last().unwrap().time()
-            );
-            feed_state.update_earliest_known(entries.last().unwrap().time());
-            let mut prepend_sticky = vec![];
-            for e in entries.iter().rev() {
-                if self1.sticky_set.contains(&e.time()) {
-                    let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
-                    prepend_sticky.push(real);
+                logn!(
+                    "??? add entries before nostop, pivot {:?}: {:?} -> {:?}",
+                    initial_pivot,
+                    entries.first().unwrap().time(),
+                    entries.last().unwrap().time()
+                );
+                feed_state.update_earliest_known(entries.last().unwrap().time());
+                for e in entries.iter().rev() {
+                    if self1.want_sticky.iter().any(|s| s == &e.time()) {
+                        let real =
+                            realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), feed_id, e.clone());
+                        self1.early_sticky.ref_push(real.el().clone());
+                        self1.reserve_sticky_entry = Some(real);
+                    }
                 }
-            }
-            self1.early_sticky.splice(0, 0, prepend_sticky);
-            feed_state.early_reserve.extend(entries);
-            feed_state.early_stop = stop;
-            self1.transition_alignment_reanchor();
+                feed_state.early_reserve.extend(entries);
+                feed_state.early_stop = stop;
+                self1.transition_alignment_reanchor();
+            });
         }
         self.shake();
     }
@@ -1390,9 +1319,9 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
     ///   entry at the time the request was received.
     pub fn respond_entries_after(
         &self,
-        feed_id: FeedId,
-        initial_pivot: Id,
-        mut entries: Vec<Rc<dyn Entry<Id>>>,
+        feed_id: &FeedIdT,
+        initial_pivot: &TimeT,
+        mut entries: Vec<Rc<dyn Entry<TimeT>>>,
         mut stop: bool,
     ) {
         logd!("EV respond entries after, {:?} len {}", initial_pivot, entries.len());
@@ -1414,185 +1343,175 @@ impl<Id: IdTraits + 'static> Infiniscroll<Id> {
         {
             let mut self1 = self.0.borrow_mut();
             let self1 = &mut *self1;
-            let Some(current_pivot) = get_pivot_late(&self1.real, feed_id, self1.feeds.get(&feed_id).unwrap()) else {
+            let Some(current_pivot) = get_pivot_late(&self1.real, feed_id, self1.feeds.get(feed_id).unwrap()) else {
                 return;
             };
-            if initial_pivot != current_pivot {
+            if initial_pivot != &current_pivot {
                 return;
             }
-            let mut all_stopped = true;
-            let mut all_reserve_empty = true;
-            for feed_state in self1.feeds.values() {
-                if !feed_state.late_stop {
-                    all_stopped = false;
+            self1.eg.event(|pc| {
+                // Gather overall state
+                let mut all_stopped = true;
+                let mut all_reserve_empty = true;
+                for feed_state in self1.feeds.values() {
+                    if !feed_state.late_stop {
+                        all_stopped = false;
+                    }
+                    if !feed_state.late_reserve.is_empty() {
+                        all_reserve_empty = false;
+                    }
                 }
-                if !feed_state.late_reserve.is_empty() {
-                    all_reserve_empty = false;
+                let feed_state = self1.feeds.get_mut(feed_id).unwrap();
+                let mut inferred_stop = true;
+                {
+                    let latest_known = feed_state.latest_known.clone().unwrap();
+                    if initial_pivot != &latest_known && entries.iter().all(|e| e.time() != latest_known) {
+                        logd!("resp doesn't include latest known {:?}, set stop = false", latest_known);
+
+                        // Know of element beyond this result (via an async channel)
+                        inferred_stop = false;
+                    }
                 }
-            }
-            let feed_state = self1.feeds.get_mut(&feed_id).unwrap();
-            let mut inferred_stop = true;
-            {
-                let latest_known = feed_state.latest_known.clone().unwrap();
-                if initial_pivot != latest_known && entries.iter().all(|e| e.time() != latest_known) {
-                    logd!("resp doesn't include latest known {:?}, set stop = false", latest_known);
 
-                    // Know of element beyond this result (via an async channel)
-                    inferred_stop = false;
-                }
-            }
-
-            bb!{
-                'done_adding _;
-                macro_rules! add_to_reserve{
-                    () => {
-                        for entry in entries {
-                            if feed_state.late_reserve.len() < MAX_RESERVE {
-                                let entry_time = entry.time();
-                                if self1.sticky_set.contains(&entry_time) {
-                                    let real =
-                                        realize_entry(
-                                            self1.entry_resize_observer.as_ref().unwrap(),
-                                            feed_id,
-                                            entry.clone(),
-                                        );
-
-                                    bb!{
-                                        'sort_insert _;
-                                        for (i, o) in self1.late_sticky.iter().enumerate() {
-                                            if entry_time < o.entry.time() {
-                                                self1.late_sticky.insert(i, real);
-                                                break 'sort_insert;
-                                            }
-                                        }
-                                        self1.late_sticky.push(real);
-                                        break 'sort_insert;
-                                    };
+                bb!{
+                    'done_adding _;
+                    macro_rules! add_to_reserve{
+                        () => {
+                            for entry in entries {
+                                if feed_state.late_reserve.len() < MAX_RESERVE {
+                                    let entry_time = entry.time();
+                                    if self1.want_sticky.iter().any(|s| s == &entry_time) {
+                                        let real =
+                                            realize_entry(
+                                                pc,
+                                                self1.entry_resize_observer.as_ref().unwrap(),
+                                                feed_id,
+                                                entry.clone(),
+                                            );
+                                        self1.reserve_sticky_entry = Some(real);
+                                    }
+                                    feed_state.late_reserve.push_back(entry);
+                                    logn!("realtime, push late reserve");
+                                } else {
+                                    logn!("realtime, stop but full, discard, now not stop");
+                                    stop = false;
+                                    break;
                                 }
-                                feed_state.late_reserve.push_back(entry);
-                                logn!("realtime, push late reserve");
-                            } else {
-                                logn!("realtime, stop but full, discard, now not stop");
-                                stop = false;
-                                break;
                             }
+                        };
+                    }
+                    // Already a reserve, new elements guaranteed to be ordered afterwards
+                    if !feed_state.late_reserve.is_empty() {
+                        logd!("has late reserve, append to reserve");
+                        add_to_reserve!();
+                        logd!("set late stop = {}", stop);
+                        feed_state.late_stop = stop;
+                        break 'done_adding;
+                    }
+                    // No reserve, new elements could need to be sorted into real depending on how
+                    // feed events interleaved
+                    let real_latest_time = self1.real.last().unwrap().entry.time();
+                    entries.reverse();
+                    let mut last_insert_before_i = 0;
+                    loop {
+                        let Some(entry) = entries.last() else {
+                            break;
+                        };
+                        let entry_time = entry.time();
+                        if entry_time >= real_latest_time {
+                            break;
                         }
-                    };
-                }
-                // Already a reserve, new elements guaranteed to be ordered afterwards
-                if !feed_state.late_reserve.is_empty() {
-                    logd!("has late reserve, append to reserve");
-                    add_to_reserve!();
+                        logd!("sort inserting entry {:?}", entry_time);
+                        let entry = entries.pop().unwrap();
+                        let insert_before_i = bb!{
+                            'find_insert _;
+                            for (i, real_state) in self1.real.iter().enumerate().skip(last_insert_before_i).rev() {
+                                if entry_time > real_state.entry.time() {
+                                    break 'find_insert i + 1;
+                                }
+                            }
+                            break 'find_insert 0;
+                        };
+                        last_insert_before_i = insert_before_i;
+                        if insert_before_i == 0 {
+                            // Insert at start of early reserve, because insertion is unbounded within
+                            // realized elements (shake will realize it if necessary) OR no real elements
+                            logd!("sort into early reserve");
+                            if self1.want_sticky.iter().any(|s| s == &entry_time) {
+                                let real =
+                                    realize_entry(
+                                        pc,
+                                        self1.entry_resize_observer.as_ref().unwrap(),
+                                        feed_id,
+                                        entry.clone(),
+                                    );
+                                self1.early_sticky.ref_push(real.el().clone());
+                                self1.reserve_sticky_entry = Some(real);
+                            }
+                            feed_state.early_reserve.push_front(entry);
+                        } else {
+                            // Insert within real elements
+                            let real = realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
+                            let anchor_i = self1.anchor_i.unwrap();
+                            if insert_before_i <= anchor_i {
+                                self1.anchor_i = Some(anchor_i + 1);
+                                logn!("sort into real; anchor_i {:?}", self1.anchor_i);
+                            }
+                            self1.real.insert(insert_before_i, real);
+                        }
+                    }
+                    // Remaining new elements come after the final real element
+                    entries.reverse();
+                    if all_stopped && all_reserve_empty {
+                        // No other feeds have reserve so these are the guaranteed next (of known
+                        // elements) - go ahead and realize.
+                        for entry in entries {
+                            logd!("append to real");
+                            let real =
+                                realize_entry(pc, self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
+                            let anchor_i = self1.anchor_i.unwrap();
+                            if anchor_i == self1.real.len() - 1 {
+                                self1.anchor_i = Some(anchor_i + 1);
+                                logn!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
+                            }
+                            self1.real.push(real);
+                        }
+                        if stop && !inferred_stop {
+                            let pivot = get_pivot_late(&self1.real, feed_id, feed_state).unwrap();
+                            feed_state.feed.request_after(pc, pivot, REQUEST_COUNT)
+                        }
+                    }
+                    else {
+                        logd!("not stopped/reserve empty, add to reserve");
+
+                        // Other feeds have reserve so these need to be pulled in by ordering (because
+                        // there's reserve we can't be anchored at last element anyway)
+                        add_to_reserve!();
+                    }
                     logd!("set late stop = {}", stop);
                     feed_state.late_stop = stop;
-                    break 'done_adding;
-                }
-                // No reserve, new elements could need to be sorted into real depending on how
-                // feed events interleaved
-                let real_latest_time = self1.real.last().unwrap().entry.time();
-                entries.reverse();
-                let mut last_insert_before_i = 0;
-                loop {
-                    let Some(entry) = entries.last() else {
-                        break;
-                    };
-                    let entry_time = entry.time();
-                    if entry_time >= real_latest_time {
-                        break;
-                    }
-                    logd!("sort inserting entry {:?}", entry_time);
-                    let entry = entries.pop().unwrap();
-                    let insert_before_i = bb!{
-                        'find_insert _;
-                        for (i, real_state) in self1.real.iter().enumerate().skip(last_insert_before_i).rev() {
-                            if entry_time > real_state.entry.time() {
-                                break 'find_insert i + 1;
-                            }
-                        }
-                        break 'find_insert 0;
-                    };
-                    last_insert_before_i = insert_before_i;
-                    if insert_before_i == 0 {
-                        // Insert at start of early reserve, because insertion is unbounded within
-                        // realized elements (shake will realize it if necessary) OR no real elements
-                        logd!("sort into early reserve");
-                        if self1.sticky_set.contains(&entry_time) {
-                            let real =
-                                realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry.clone());
-
-                            bb!{
-                                'sort_insert _;
-                                for (i, o) in self1.early_sticky.iter().enumerate() {
-                                    if entry_time > o.entry.time() {
-                                        self1.early_sticky.insert(i, real);
-                                        break 'sort_insert;
-                                    }
-                                }
-                                self1.late_sticky.push(real);
-                                break 'sort_insert;
-                            };
-                        }
-                        feed_state.early_reserve.push_front(entry);
-                    } else {
-                        // Insert within real elements
-                        let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
-                        let anchor_i = self1.anchor_i.unwrap();
-                        if insert_before_i <= anchor_i {
-                            self1.anchor_i = Some(anchor_i + 1);
-                            logn!("sort into real; anchor_i {:?}", self1.anchor_i);
-                        }
-                        self1.real.insert(insert_before_i, real);
-                    }
-                }
-                // Remaining new elements come after the final real element
-                entries.reverse();
-                if all_stopped && all_reserve_empty {
-                    // No other feeds have reserve so these are the guaranteed next (of known
-                    // elements) - go ahead and realize.
-                    for entry in entries {
-                        logd!("append to real");
-                        let real = realize_entry(self1.entry_resize_observer.as_ref().unwrap(), feed_id, entry);
-                        let anchor_i = self1.anchor_i.unwrap();
-                        if anchor_i == self1.real.len() - 1 {
-                            self1.anchor_i = Some(anchor_i + 1);
-                            logn!("realtime, anchor_i reset to last {:?}", self1.anchor_i);
-                        }
-                        self1.real.push(real);
-                    }
-                    if stop && !inferred_stop {
-                        let pivot = get_pivot_late(&self1.real, feed_id, feed_state).unwrap();
-                        feed_state.feed.request_after(pivot, REQUEST_COUNT)
-                    }
-                }
-                else {
-                    logd!("not stopped/reserve empty, add to reserve");
-
-                    // Other feeds have reserve so these need to be pulled in by ordering (because
-                    // there's reserve we can't be anchored at last element anyway)
-                    add_to_reserve!();
-                }
-                logd!("set late stop = {}", stop);
-                feed_state.late_stop = stop;
-            };
+                };
+            });
         }
         self.shake();
         logd!("EV respond entries after, DONE");
     }
 
-    /// Called by feed when notified of new entries. Note that this may immediately
-    /// call `request_after` (re-entering feed stack context) so be careful of hodling
-    /// borrows when calling this.
-    pub fn notify_entry_after(&self, feed_id: FeedId, entry_id: Id) {
-        logd!("EV notify after, {:?}", entry_id);
+    /// Called by feed when notified of new entries, to decide if the view is in a
+    /// state where it can accept more entries. Returns a pivot if new entries are
+    /// acceptable.
+    pub fn want_after(&self, feed_id: FeedIdT, entry_id: TimeT) -> Option<TimeT> {
         let mut self1 = self.0.borrow_mut();
         let self1 = &mut *self1;
         let f_state = self1.feeds.get_mut(&feed_id).unwrap();
         if f_state.update_latest_known(entry_id) && f_state.late_stop {
-            if f_state.late_stop {
-                logd!("-> request after");
-                let pivot = get_pivot_late(&self1.real, feed_id, f_state).unwrap();
-                f_state.feed.request_after(pivot, REQUEST_COUNT)
-            }
+            // nop
+        } else {
+            return None;
         }
+        if !f_state.late_stop {
+            return None;
+        }
+        return Some(get_pivot_late(&self1.real, &feed_id, f_state).unwrap());
     }
 }

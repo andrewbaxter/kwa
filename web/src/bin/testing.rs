@@ -30,7 +30,6 @@ use wasm_bindgen_futures::spawn_local;
 use web::{
     infiniscroll::{
         Entry,
-        FeedId,
         WeakInfiniscroll,
         Feed,
         Infiniscroll,
@@ -46,10 +45,10 @@ fn main() {
     let eg = lunk::EventGraph::new();
     eg.event(|_pc| {
         #[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Debug, Hash)]
-        struct DemoFeedId(i64, &'static str);
+        struct DemoId(i64, &'static str);
 
         struct DemoFeedShared {
-            parent: Option<(WeakInfiniscroll<DemoFeedId>, FeedId)>,
+            parent: Option<WeakInfiniscroll<i32, DemoId>>,
             name: &'static str,
             start: i64,
             hist: Vec<i64>,
@@ -70,11 +69,11 @@ fn main() {
 
         struct DemoEntry {
             feed: Rc<RefCell<DemoFeedShared>>,
-            t: DemoFeedId,
+            t: DemoId,
         }
 
         impl DemoEntry {
-            fn new(feed: &Rc<RefCell<DemoFeedShared>>, i: DemoFeedId) -> Rc<dyn Entry<DemoFeedId>> {
+            fn new(feed: &Rc<RefCell<DemoFeedShared>>, i: DemoId) -> Rc<dyn Entry<DemoId>> {
                 return Rc::new(DemoEntry {
                     feed: feed.clone(),
                     t: i,
@@ -82,7 +81,7 @@ fn main() {
             }
         }
 
-        impl Entry<DemoFeedId> for DemoEntry {
+        impl Entry<DemoId> for DemoEntry {
             fn create_el(&self) -> El {
                 return el("div")
                     .classes(&["testing_entry"])
@@ -93,7 +92,7 @@ fn main() {
                         let t = self.t;
                         move |e| {
                             logn!("clickoo");
-                            let Some((parent, id_in_parent)) =
+                            let Some(parent) =
                             //. .
                             & feed.borrow().parent else {
                                 return;
@@ -105,27 +104,28 @@ fn main() {
                             selected = !selected;
                             if selected {
                                 e.ref_classes(&["sticky"]);
-                                parent.sticky(*id_in_parent, t);
+                                parent.set_sticky(&t);
                             } else {
                                 e.ref_remove_classes(&["sticky"]);
-                                parent.unsticky(t);
+                                parent.clear_sticky();
                             }
                         }
                     });
             }
 
-            fn time(&self) -> DemoFeedId {
+            fn time(&self) -> DemoId {
                 return self.t;
             }
         }
 
         struct DemoFeed {
+            id: i32,
             shared: Rc<RefCell<DemoFeedShared>>,
             _generate: Option<Interval>,
         }
 
         impl DemoFeed {
-            fn new(name: &'static str, initial_count: usize, generate_interval: Option<u32>) -> Self {
+            fn new(id: i32, name: &'static str, initial_count: usize, generate_interval: Option<u32>) -> Self {
                 let start = Utc::now().timestamp_millis();
                 let mut hist = vec![];
                 for i in 0 .. initial_count {
@@ -138,12 +138,12 @@ fn main() {
                     hist: hist,
                 }));
                 return DemoFeed {
+                    id: id,
                     shared: shared.clone(),
                     _generate: generate_interval.map(|interval| Interval::new(interval, {
                         let shared = Rc::downgrade(&shared);
                         move || {
                             let parent;
-                            let id_in_parent;
                             let i;
                             {
                                 let Some(shared) = shared.upgrade() else {
@@ -151,37 +151,35 @@ fn main() {
                                 };
                                 let mut shared1 = shared.borrow_mut();
                                 let shared1 = &mut *shared1;
-                                let Some((parent0, id_in_parent0)) =
+                                let Some(parent0) =
                                 //. .
                                 & shared1.parent else {
                                     return;
                                 };
-                                id_in_parent = *id_in_parent0;
                                 let Some(parent0) = parent0.upgrade() else {
                                     return;
                                 };
                                 parent = parent0;
                                 let time = Utc::now().timestamp_millis() - shared1.start;
                                 shared1.hist.push(time);
-                                i = DemoFeedId(time, shared1.name);
+                                i = DemoId(time, shared1.name);
                             }
-                            parent.notify_entry_after(id_in_parent, i);
+                            parent.notify_entry_after(id, i);
                         }
                     })),
                 };
             }
         }
 
-        impl Feed<DemoFeedId> for DemoFeed {
-            fn set_parent(&self, parent: WeakInfiniscroll<DemoFeedId>, id_in_parent: usize) {
-                self.shared.borrow_mut().parent = Some((parent, id_in_parent));
+        impl Feed<i32, DemoId> for DemoFeed {
+            fn set_parent(&self, parent: WeakInfiniscroll<i32, DemoId>) {
+                self.shared.borrow_mut().parent = Some(parent);
             }
 
-            fn request_around(&self, pivot: DemoFeedId, count: usize) {
+            fn request_around(&self, pivot: DemoId, count: usize) {
                 let self1 = self.shared.borrow();
-                let (parent, id_in_parent) = self1.parent.as_ref().unwrap();
-                let parent = parent.upgrade().unwrap();
-                let id_in_parent = *id_in_parent;
+                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
+                let id_in_parent = self.id;
                 let i = self1.find(pivot.0);
                 let name = self1.name;
                 let out;
@@ -222,7 +220,7 @@ fn main() {
                         parent.respond_entries_around(
                             id_in_parent,
                             pivot,
-                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoFeedId(t, name))).collect(),
+                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
                             early_stop,
                             late_stop,
                         );
@@ -230,11 +228,10 @@ fn main() {
                 });
             }
 
-            fn request_before(&self, pivot: DemoFeedId, count: usize) {
+            fn request_before(&self, pivot: DemoId, count: usize) {
                 let self1 = self.shared.borrow();
-                let (parent, id_in_parent) = self1.parent.as_ref().unwrap();
-                let parent = parent.upgrade().unwrap();
-                let id_in_parent = *id_in_parent;
+                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
+                let id_in_parent = self.id;
                 let i = self1.find(pivot.0);
                 let name = self1.name;
                 let out;
@@ -263,20 +260,19 @@ fn main() {
 
                         //. TimeoutFuture::new(0).await;
                         parent.respond_entries_before(
-                            id_in_parent,
-                            pivot,
-                            out.into_iter().rev().map(|t| DemoEntry::new(&shared, DemoFeedId(t, name))).collect(),
+                            &id_in_parent,
+                            &pivot,
+                            out.into_iter().rev().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
                             early_stop,
                         );
                     }
                 });
             }
 
-            fn request_after(&self, pivot: DemoFeedId, count: usize) {
+            fn request_after(&self, pivot: DemoId, count: usize) {
                 let self1 = self.shared.borrow();
-                let (parent, id_in_parent) = self1.parent.as_ref().unwrap();
-                let parent = parent.upgrade().unwrap();
-                let id_in_parent = *id_in_parent;
+                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
+                let id_in_parent = self.id;
                 let i = self1.find(pivot.0);
                 let name = self1.name;
                 let out;
@@ -306,9 +302,9 @@ fn main() {
 
                         //. TimeoutFuture::new(0).await;
                         parent.respond_entries_after(
-                            id_in_parent,
-                            pivot,
-                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoFeedId(t, name))).collect(),
+                            &id_in_parent,
+                            &pivot,
+                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
                             late_stop,
                         );
                     }
@@ -321,11 +317,14 @@ fn main() {
         //. let inf1 = Infiniscroll::new(now, vec![Box::new(DemoFeed::new("alpha", 1000, Some(5000)))]);
         let inf1 =
             Infiniscroll::new(
-                DemoFeedId(now, "alpha"),
-                vec![
-                    Box::new(DemoFeed::new("alpha", 1000, Some(5000))),
-                    Box::new(DemoFeed::new("beta", 500, Some(4500)))
-                ],
+                DemoId(now, "alpha"),
+                [
+                    Box::new(DemoFeed::new(0, "alpha", 1000, Some(5000))),
+                    Box::new(DemoFeed::new(1, "beta", 500, Some(4500))),
+                ]
+                    .into_iter()
+                    .map(|f| (f.id, f as Box<dyn Feed<i32, DemoId>>))
+                    .collect(),
             );
 
         //. let inf1 = Infiniscroll::new(1000, vec![Box::new(DemoFeed::new(1000, None))]);

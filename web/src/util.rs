@@ -6,6 +6,15 @@ use std::{
         Mul,
     },
     future::Future,
+    pin::pin,
+};
+use futures::{
+    channel::oneshot::{
+        Sender,
+        channel,
+    },
+    select,
+    FutureExt,
 };
 use gloo::storage::{
     LocalStorage,
@@ -24,6 +33,7 @@ use serde::{
     de::DeserializeOwned,
     Serialize,
 };
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 pub trait MoreMath {
@@ -108,6 +118,40 @@ impl<T, E: Display> MyError<T> for Result<T, E> {
     }
 }
 
+pub trait MyErrorJsValue<T> {
+    fn log_ignore(self, context: &str);
+    fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String>;
+    fn context(self, context: &str) -> Result<T, String>;
+}
+
+impl<T> MyErrorJsValue<T> for Result<T, JsValue> {
+    fn log_ignore(self, context: &str) {
+        match self {
+            Ok(_) => { },
+            Err(e) => {
+                log!("{}: {:?}", context, e.as_string());
+            },
+        }
+    }
+
+    fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String> {
+        match self {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                log!("{}: {:?}", context, e.as_string());
+                return Err(replacement.to_string());
+            },
+        }
+    }
+
+    fn context(self, context: &str) -> Result<T, String> {
+        match self {
+            Ok(v) => return Ok(v),
+            Err(e) => return Err(format!("{}: {:?}", context, e.as_string())),
+        };
+    }
+}
+
 impl<T> MyError<T> for Option<T> {
     fn log_ignore(self, context: &str) {
         match self {
@@ -185,6 +229,28 @@ pub fn bg<F: 'static + Future<Output = Result<(), String>>>(f: F) {
             },
         };
     });
+}
+
+struct RootedSpawn(Option<Sender<()>>);
+
+impl Drop for RootedSpawn {
+    fn drop(&mut self) {
+        self.0.take().unwrap().send(()).unwrap();
+    }
+}
+
+/// Spawn an async task that will be cancelled if the returned value is dropped.
+pub fn spawn_rooted<F: 'static + Future<Output = ()>>(task: F) -> ScopeValue {
+    let (send_die, mut recv_die) = channel();
+    spawn_local(async move {
+        let mut task = pin!(task.fuse());
+
+        select!{
+            _ = recv_die =>(),
+            _ = task =>(),
+        };
+    });
+    return scope_any(RootedSpawn(Some(send_die)));
 }
 
 #[macro_export]

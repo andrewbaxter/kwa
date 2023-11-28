@@ -13,6 +13,11 @@ use rooting::{
     El,
 };
 use wasm_bindgen_futures::spawn_local;
+use crate::noworlater::{
+    NowOrLaterKey,
+    NowOrLaterValue,
+    NowOrLater,
+};
 
 pub const CSS_HIDE: &'static str = "hide";
 
@@ -175,4 +180,35 @@ pub fn async_area(
         }
     });
     return (e, do_async);
+}
+
+pub fn nol_span<
+    K: NowOrLaterKey,
+    V: NowOrLaterValue,
+>(pc: &mut ProcessingContext, nol: NowOrLater<K, V>, f: impl 'static + FnOnce(&V) -> Prim<String>) -> El {
+    let out = el("span");
+    match nol {
+        NowOrLater::Now(v) => {
+            out.ref_bind_text(pc, &f(&*v));
+        },
+        NowOrLater::Later(r) => {
+            out.ref_text("...");
+            spawn_local({
+                let out = out.weak();
+                let eg = pc.eg();
+                async move {
+                    let Some(out) = out.upgrade() else {
+                        return;
+                    };
+                    let Ok(v) = r.await else {
+                        return;
+                    };
+                    eg.event(|pc| {
+                        out.ref_bind_text(pc, &f(&*v));
+                    });
+                }
+            })
+        },
+    }
+    return out;
 }

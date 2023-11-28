@@ -20,7 +20,19 @@ pub struct ChannelId(pub IdentityId, pub u16);
 pub struct MessageId(pub ChannelId, pub u64);
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+pub struct DateMessageId(pub DateTime<Utc>, pub MessageId);
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub struct BrewId(pub usize);
+
+#[derive(Serialize, Deserialize)]
+pub struct S2SWPush {
+    pub id: MessageId,
+    pub time: DateTime<Utc>,
+    pub title: String,
+    pub quote: String,
+    pub icon_url: String,
+}
 
 #[derive(Serialize, Deserialize)]
 pub enum U2SPost {
@@ -51,16 +63,20 @@ pub enum U2SGet {
     GetChannels,
     GetBrews,
     GetOwnIdentities,
-    GetAround {
+    EventsGetAfter {
+        id: MessageId,
+        count: u64,
+    },
+    SnapGetAround {
         channel: ChannelId,
         time: DateTime<Utc>,
         count: u64,
     },
-    GetBefore {
+    SnapGetBefore {
         id: MessageId,
         count: u64,
     },
-    GetAfter {
+    SnapGetAfter {
         id: MessageId,
         count: u64,
     },
@@ -87,7 +103,14 @@ pub struct S2UMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct S2UGetAroundResp {
+pub struct S2UEventsGetAfterResp {
+    pub server_time: MessageId,
+    pub entries: Vec<S2UMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct S2USnapGetAroundResp {
+    pub server_time: MessageId,
     pub entries: Vec<S2UMessage>,
     pub early_stop: bool,
     pub late_stop: bool,
@@ -95,12 +118,14 @@ pub struct S2UGetAroundResp {
 
 #[derive(Serialize, Deserialize)]
 pub struct S2UGetBeforeResp {
+    pub server_time: MessageId,
     pub entries: Vec<S2UMessage>,
     pub early_stop: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct S2UGetAfterResp {
+    pub server_time: MessageId,
     pub entries: Vec<S2UMessage>,
     pub late_stop: bool,
 }
