@@ -4,13 +4,15 @@ use lunk::{
     Prim,
 };
 use wasm_bindgen::JsValue;
-use web::world::FeedId;
+use web::{
+    world::FeedId,
+    scrollentry::FeedTime,
+};
 use super::{
     viewid::{
         ChannelViewStateId,
         BrewViewStateId,
         ViewStateId,
-        FeedTime,
     },
     view::{
         ChannelViewState,
@@ -145,8 +147,8 @@ pub fn set_view_message(pc: &mut ProcessingContext, state: &State, message_time:
             channel_id = i.0.clone();
         },
     }
-    set_view(pc, state, match &*state.0.view.borrow() {
-        ViewState::Channels => &ViewStateId::Channel(ChannelViewStateId {
+    set_view(pc, state, &match &*state.0.view.borrow() {
+        ViewState::Channels => ViewStateId::Channel(ChannelViewStateId {
             id: channel_id,
             message: Some(message_time),
         }),
@@ -154,22 +156,22 @@ pub fn set_view_message(pc: &mut ProcessingContext, state: &State, message_time:
             match &*m.borrow() {
                 MessagesViewMode::Brew(b) => {
                     if state.0.channel_feeds.borrow().iter().any(|f| f.channel() == &channel_id) {
-                        &ViewStateId::Brew(BrewViewStateId {
+                        ViewStateId::Brew(BrewViewStateId {
                             id: b.id.clone(),
-                            channel: b.channel.borrow().map(|c| ChannelViewStateId {
+                            channel: b.channel.borrow().as_ref().map(|_| ChannelViewStateId {
                                 id: channel_id,
                                 message: Some(message_time),
                             }),
                         })
                     } else {
-                        &ViewStateId::Channel(ChannelViewStateId {
+                        ViewStateId::Channel(ChannelViewStateId {
                             id: channel_id,
                             message: Some(message_time),
                         })
                     }
                 },
-                MessagesViewMode::Channel(c) => {
-                    &ViewStateId::Channel(ChannelViewStateId {
+                MessagesViewMode::Channel(_) => {
+                    ViewStateId::Channel(ChannelViewStateId {
                         id: channel_id,
                         message: Some(message_time.clone()),
                     })

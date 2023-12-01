@@ -23,6 +23,8 @@ use web::{
         S2UChannel,
     },
     noworlater::NowOrLaterCollection,
+    outboxfeed::OutboxFeed,
+    messagefeed::ChannelFeed,
 };
 use super::{
     view::{
@@ -30,10 +32,6 @@ use super::{
         Brew,
         Channel,
     },
-    messagefeed::{
-        ChannelFeed,
-    },
-    outboxfeed::OutboxFeed,
 };
 
 /// A non-session-persisted view state (menu, dialog, etc).
@@ -45,7 +43,7 @@ pub enum TempViewState {
 }
 
 pub struct State_ {
-    pub db: IdbDatabase,
+    pub db: Rc<IdbDatabase>,
     pub eg: EventGraph,
     pub local_id_base: i64,
     pub local_id_counter: AtomicI16,
@@ -64,7 +62,7 @@ pub struct State_ {
 pub struct State(pub Rc<State_>);
 
 impl State {
-    pub fn new(pc: &mut ProcessingContext, db: IdbDatabase, world: &World) -> State {
+    pub fn new(pc: &mut ProcessingContext, db: Rc<IdbDatabase>, world: &World) -> State {
         return State(Rc::new(State_ {
             db: db,
             eg: pc.eg(),

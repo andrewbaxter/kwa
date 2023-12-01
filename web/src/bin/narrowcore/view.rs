@@ -2,12 +2,14 @@ use lunk::{
     Prim,
     List,
 };
-use web::world::{
-    MessageId,
-    ChannelId,
-    BrewId,
+use web::{
+    world::{
+        MessageId,
+        ChannelId,
+        BrewId,
+    },
+    scrollentry::FeedTime,
 };
-use super::viewid::FeedTime;
 
 #[derive(Clone)]
 pub struct Message {

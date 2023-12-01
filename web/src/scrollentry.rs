@@ -6,51 +6,40 @@ use std::{
     },
     collections::HashMap,
 };
-use chrono::Utc;
+use chrono::{
+    Utc,
+    DateTime,
+};
 use lunk::{
     Prim,
     ProcessingContext,
-    EventGraph,
 };
 use rooting::{
     El,
     el,
-    ScopeValue,
 };
-use wasm_bindgen_futures::spawn_local;
-use web::{
+use serde::{
+    Serialize,
+    Deserialize,
+};
+use crate::{
     infiniscroll::{
         Entry,
-        WeakInfiniscroll,
-        Feed,
-        REQUEST_COUNT,
     },
     html::{
         vbox,
         ElExt,
     },
-    util::{
-        bg,
-        spawn_rooted,
-    },
-    enum_unwrap,
     world::{
-        S2USnapGetAroundResp,
-        U2SGet,
-        ChannelId,
-        MessageId,
-        DateMessageId,
-        S2UEventsGetAfterResp,
         FeedId,
     },
-    log,
 };
-use super::{
-    viewid::{
-        FeedTime,
-    },
-    state::State,
-};
+
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize)]
+pub struct FeedTime {
+    pub stamp: DateTime<Utc>,
+    pub id: FeedId,
+}
 
 pub struct EntryMap(pub Rc<RefCell<HashMap<FeedId, FeedEntry>>>);
 

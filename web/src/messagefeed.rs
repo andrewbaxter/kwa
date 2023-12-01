@@ -2,33 +2,21 @@ use std::{
     cell::RefCell,
     rc::{
         Rc,
-        Weak,
     },
-    collections::HashMap,
 };
-use chrono::Utc;
 use lunk::{
-    Prim,
-    ProcessingContext,
     EventGraph,
 };
 use rooting::{
-    El,
-    el,
     ScopeValue,
     defer,
 };
-use wasm_bindgen_futures::spawn_local;
-use web::{
+use crate::{
     infiniscroll::{
         Entry,
         WeakInfiniscroll,
         Feed,
         REQUEST_COUNT,
-    },
-    html::{
-        vbox,
-        ElExt,
     },
     util::{
         bg,
@@ -43,17 +31,14 @@ use web::{
         DateMessageId,
         S2UEventsGetAfterResp,
         FeedId,
+        World,
     },
-    log,
 };
 use super::{
-    viewid::{
-        FeedTime,
-    },
-    state::State,
     scrollentry::{
         EntryMap,
         FeedEntry,
+        FeedTime,
     },
 };
 
@@ -65,7 +50,7 @@ struct ChannelFeedMut {
 
 pub struct ChannelFeed_ {
     id: ChannelId,
-    state: State,
+    world: World,
     mut_: RefCell<ChannelFeedMut>,
     entries: EntryMap,
 }
@@ -74,10 +59,10 @@ pub struct ChannelFeed_ {
 pub struct ChannelFeed(Rc<ChannelFeed_>);
 
 impl ChannelFeed {
-    pub fn new(state: &State, id: ChannelId) -> Self {
+    pub fn new(world: World, id: ChannelId) -> Self {
         return ChannelFeed(Rc::new(ChannelFeed_ {
             id: id,
-            state: state.clone(),
+            world: world,
             mut_: RefCell::new(ChannelFeedMut {
                 parent: None,
                 server_time: None,
@@ -93,13 +78,10 @@ impl ChannelFeed {
         }
         let want_after;
         {
-            let mut mut_ = self.0.mut_.borrow_mut();
-            if mut_.server_time.is_some() && id.1 <= mut_.server_time.unwrap() {
+            let mut_ = self.0.mut_.borrow_mut();
+            if mut_.server_time.is_some() && &id.1 <= mut_.server_time.as_ref().unwrap() {
                 return;
             }
-            let Some(parent) = mut_.parent.clone().and_then(|p| p.upgrade()) else {
-                return;
-            };
             let Some(parent) = mut_.parent.clone().and_then(|p| p.upgrade()) else {
                 return;
             };
@@ -133,7 +115,7 @@ impl ChannelFeed {
                     }
                 });
                 loop {
-                    let resp = self1.0.state.0.world.req_get::<S2UEventsGetAfterResp>(U2SGet::EventsGetAfter {
+                    let resp = self1.0.world.req_get::<S2UEventsGetAfterResp>(U2SGet::EventsGetAfter {
                         id: self1.0.mut_.borrow().server_time.clone(),
                         count: REQUEST_COUNT as u64,
                     }).await?;
@@ -141,12 +123,13 @@ impl ChannelFeed {
                         break;
                     }
                     {
-                        let mut_ = self.0.mut_.borrow_mut();
+                        let mut mut_ = self1.0.mut_.borrow_mut();
                         let mut server_time = None;
                         eg.event(|pc| {
                             for entry in resp.entries {
-                                server_time = Some(entry.id);
-                                let Some(e) = self1.0.entries.0.borrow_mut().get_mut(&FeedId::Real(entry.id)) else {
+                                server_time = Some(entry.id.clone());
+                                let mut entries = self1.0.entries.0.borrow_mut();
+                                let Some(e) = entries.get_mut(&FeedId::Real(entry.id.clone())) else {
                                     continue;
                                 };
                                 e.0.text.set(pc, entry.text);
@@ -162,7 +145,7 @@ impl ChannelFeed {
 }
 
 impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
-    fn set_parent(&self, parent: web::infiniscroll::WeakInfiniscroll<Option<ChannelId>, FeedTime>) {
+    fn set_parent(&self, parent: crate::infiniscroll::WeakInfiniscroll<Option<ChannelId>, FeedTime>) {
         self.0.mut_.borrow_mut().parent = Some(parent);
     }
 
@@ -170,7 +153,7 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
         bg("Channel feed - requesting messages around", {
             let self1 = self.clone();
             async move {
-                let resp: S2USnapGetAroundResp = self1.0.state.0.world.req_get(U2SGet::SnapGetAround {
+                let resp: S2USnapGetAroundResp = self1.0.world.req_get(U2SGet::SnapGetAround {
                     channel: self1.0.id.clone(),
                     time: time.stamp,
                     count: count as u64,
@@ -179,7 +162,7 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                     let refresh;
                     {
                         let mut mut_ = self1.0.mut_.borrow_mut();
-                        let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                        let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                             return;
                         };
                         parent.respond_entries_around(
@@ -194,8 +177,8 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                         );
                         if mut_.server_time.is_none() {
                             refresh = true;
-                        } else if mut_.server_time.unwrap() != resp.server_time {
-                            if resp.server_time < mut_.server_time.unwrap() {
+                        } else if mut_.server_time.as_ref().unwrap() != &resp.server_time {
+                            if &resp.server_time < mut_.server_time.as_ref().unwrap() {
                                 mut_.server_time = Some(resp.server_time);
                             }
                             refresh = true;
@@ -216,7 +199,7 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
         bg("Channel feed, requesting messages before", {
             let self1 = self.clone();
             async move {
-                let resp: S2USnapGetAroundResp = self1.0.state.0.world.req_get(U2SGet::SnapGetBefore {
+                let resp: S2USnapGetAroundResp = self1.0.world.req_get(U2SGet::SnapGetBefore {
                     id: enum_unwrap!(&time.id, FeedId:: Real(x) => x.clone()),
                     count: count as u64,
                 }).await?;
@@ -224,11 +207,11 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                     let refresh;
                     {
                         let mut mut_ = self1.0.mut_.borrow_mut();
-                        let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                        let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                             return;
                         };
                         parent.respond_entries_before(
-                            &Some(self.0.id.clone()),
+                            &Some(self1.0.id.clone()),
                             &time,
                             resp.entries.into_iter().map(|e| Rc::new(FeedEntry::new(pc, FeedTime {
                                 stamp: e.time,
@@ -238,8 +221,8 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                         );
                         if mut_.server_time.is_none() {
                             refresh = true;
-                        } else if mut_.server_time.unwrap() != resp.server_time {
-                            if resp.server_time < mut_.server_time.unwrap() {
+                        } else if mut_.server_time.as_ref().unwrap() != &resp.server_time {
+                            if &resp.server_time < mut_.server_time.as_ref().unwrap() {
                                 mut_.server_time = Some(resp.server_time);
                             }
                             refresh = true;
@@ -260,7 +243,7 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
         bg("Channel feed, requesting messages after", {
             let self1 = self.clone();
             async move {
-                let resp: S2USnapGetAroundResp = self1.0.state.0.world.req_get(U2SGet::SnapGetAfter {
+                let resp: S2USnapGetAroundResp = self1.0.world.req_get(U2SGet::SnapGetAfter {
                     id: enum_unwrap!(&time.id, FeedId:: Real(x) => x.clone()),
                     count: count as u64,
                 }).await?;
@@ -268,11 +251,11 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                     let refresh;
                     {
                         let mut mut_ = self1.0.mut_.borrow_mut();
-                        let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                        let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                             return;
                         };
                         parent.respond_entries_after(
-                            &Some(self.0.id.clone()),
+                            &Some(self1.0.id.clone()),
                             &time,
                             resp.entries.into_iter().map(|e| Rc::new(FeedEntry::new(pc, FeedTime {
                                 stamp: e.time,
@@ -282,8 +265,8 @@ impl Feed<Option<ChannelId>, FeedTime> for ChannelFeed {
                         );
                         if mut_.server_time.is_none() {
                             refresh = true;
-                        } else if mut_.server_time.unwrap() != resp.server_time {
-                            if resp.server_time < mut_.server_time.unwrap() {
+                        } else if mut_.server_time.as_ref().unwrap() != &resp.server_time {
+                            if &resp.server_time < mut_.server_time.as_ref().unwrap() {
                                 mut_.server_time = Some(resp.server_time);
                             }
                             refresh = true;

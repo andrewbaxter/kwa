@@ -1,23 +1,14 @@
-use chrono::{
-    DateTime,
-    Utc,
-};
 use serde::{
     Serialize,
     Deserialize,
 };
-use web::world::{
-    ChannelId,
-    BrewId,
-    MessageId,
-    FeedId,
+use web::{
+    world::{
+        ChannelId,
+        BrewId,
+    },
+    scrollentry::FeedTime,
 };
-
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize)]
-pub struct FeedTime {
-    pub stamp: DateTime<Utc>,
-    pub id: FeedId,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChannelViewStateId {

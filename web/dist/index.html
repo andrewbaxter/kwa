@@ -13,12 +13,13 @@
       type="application/wasm"
       crossorigin=""
     />
-    <link rel="modulepreload" href="/web.js" />
+    <link rel="modulepreload" href="/narrow.js" />
+    <link rel="modulepreload" href="/serviceworker.js" />
   </head>
   <body>
     <script type="module">
-      import init from "/web.js";
-      init("/web_bg.wasm");
+      import init from "/narrow.js";
+      init("/narrow_bg.wasm");
     </script>
   </body>
 </html>

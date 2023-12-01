@@ -2,82 +2,53 @@ use std::{
     cell::RefCell,
     rc::{
         Rc,
-        Weak,
     },
-    collections::HashMap,
 };
 use chrono::{
     Utc,
-    DateTime,
 };
 use gloo::utils::format::JsValueSerdeExt;
 use indexed_db_futures::{
     IdbQuerySource,
-    IdbIndex,
+    IdbDatabase,
 };
 use lunk::{
-    Prim,
     ProcessingContext,
     EventGraph,
 };
-use rooting::{
-    El,
-    el,
-    ScopeValue,
-};
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::spawn_local;
-use web::{
+use crate::{
     infiniscroll::{
         Entry,
         WeakInfiniscroll,
         Feed,
-        REQUEST_COUNT,
-    },
-    html::{
-        vbox,
-        ElExt,
     },
     util::{
         bg,
-        spawn_rooted,
         MyErrorDomException,
     },
     enum_unwrap,
     world::{
-        S2USnapGetAroundResp,
-        U2SGet,
         ChannelId,
-        MessageId,
-        DateMessageId,
-        S2UEventsGetAfterResp,
         FeedId,
     },
-    log,
     dbmodel::{
         TABLE_OUTBOX,
-        OutboxEntryV1,
         OutboxEntry,
         TABLE_OUTBOX_INDEX_STAMP,
         from_outbox,
         outbox_key,
     },
     bb,
+    scrollentry::{
+        FeedEntry,
+        EntryMap,
+        FeedTime,
+    },
 };
 use web_sys::{
     IdbCursorDirection,
     IdbKeyRange,
-    IdbCursor,
-};
-use crate::narrowcore::scrollentry::{
-    FeedEntry,
-    EntryMap,
-};
-use super::{
-    viewid::{
-        FeedTime,
-    },
-    state::State,
 };
 
 struct OutboxFeedMut {
@@ -85,7 +56,7 @@ struct OutboxFeedMut {
 }
 
 struct OutboxFeed_ {
-    state: State,
+    db: Rc<IdbDatabase>,
     mut_: RefCell<OutboxFeedMut>,
 }
 
@@ -93,9 +64,9 @@ struct OutboxFeed_ {
 pub struct OutboxFeed(Rc<OutboxFeed_>);
 
 impl OutboxFeed {
-    pub fn new(state: &State) -> OutboxFeed {
+    pub fn new(db: Rc<IdbDatabase>) -> OutboxFeed {
         return OutboxFeed(Rc::new(OutboxFeed_ {
-            state: state.clone(),
+            db: db,
             mut_: RefCell::new(OutboxFeedMut { parent: None }),
         }));
     }
@@ -111,42 +82,13 @@ impl OutboxFeed {
                 stamp: Utc::now(),
                 id: FeedId::Local(channel, id),
             };
-            let Some((pivot1, count)) = parent.want_after(None, time.clone()) else {
+            let Some((pivot1, count1)) = parent.want_after(None, time.clone()) else {
                 return;
             };
             pivot = pivot1;
+            count = count1;
         }
         self.request_after(eg, pivot, count);
-    }
-}
-
-async fn read_before<
-    'x,
->(time_index: &IdbIndex<'x>, pivot: DateTime<Utc>, count: usize) -> Result<(bool, Vec<OutboxEntry>), String> {
-    let mut before = vec![];
-    let Some(
-        cursor
-    ) = time_index.open_cursor_with_range_and_direction(
-        &IdbKeyRange::upper_bound_with_open(
-            &<JsValue as JsValueSerdeExt>::from_serde(&pivot).unwrap(),
-            true,
-        ).unwrap(),
-        IdbCursorDirection::Prev
-    ).context("Failed to open outbox cursor") ?.await.context("Error waiting for cursor") ? else {
-        return Ok((true, before));
-    };
-    loop {
-        if before.len() >= count {
-            return Ok((false, before));
-        }
-        if !cursor
-            .continue_cursor()
-            .context("Error moving cursor forward")?
-            .await
-            .context("Error retrieving cursor advance result")? {
-            return Ok((false, before));
-        }
-        before.push(from_outbox(&cursor.value()));
     }
 }
 
@@ -163,7 +105,7 @@ fn finish_entries(pc: &mut ProcessingContext, v: Vec<OutboxEntry>) -> Vec<Rc<dyn
 }
 
 impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
-    fn set_parent(&self, parent: web::infiniscroll::WeakInfiniscroll<Option<ChannelId>, FeedTime>) {
+    fn set_parent(&self, parent: crate::infiniscroll::WeakInfiniscroll<Option<ChannelId>, FeedTime>) {
         self.0.mut_.borrow_mut().parent = Some(parent);
     }
 
@@ -174,17 +116,11 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                 let txn =
                     self1
                         .0
-                        .state
-                        .0
                         .db
                         .transaction_on_multi_with_mode(&[TABLE_OUTBOX], web_sys::IdbTransactionMode::Readonly)
                         .context("Failed to start transaction")?;
-                let time_index =
-                    txn
-                        .object_store(TABLE_OUTBOX)
-                        .context("Failed to get outbox")?
-                        .index(TABLE_OUTBOX_INDEX_STAMP)
-                        .context("Failed to get outbox stamp index")?;
+                let outbox = txn.object_store(TABLE_OUTBOX).context("Failed to get outbox")?;
+                let time_index = outbox.index(TABLE_OUTBOX_INDEX_STAMP).context("Failed to get outbox stamp index")?;
 
                 // Get elements before pivot
                 let mut early_stop = true;
@@ -260,8 +196,8 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                 let mut all = before;
                 all.extend(after_including);
                 eg.event(|pc| {
-                    let mut mut_ = self1.0.mut_.borrow_mut();
-                    let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                    let mut_ = self1.0.mut_.borrow();
+                    let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                         return;
                     };
                     parent.respond_entries_around(None, time, finish_entries(pc, all), early_stop, late_stop);
@@ -278,8 +214,6 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                 let txn =
                     self1
                         .0
-                        .state
-                        .0
                         .db
                         .transaction_on_multi_with_mode(&[TABLE_OUTBOX], web_sys::IdbTransactionMode::Readonly)
                         .context("Failed to start transaction")?;
@@ -295,7 +229,7 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                         cursor
                     ) = outbox.open_cursor_with_range_and_direction(
                         &IdbKeyRange::upper_bound_with_open(
-                            &outbox_key(&enum_unwrap!(time.id, FeedId:: Local(_, id) => id)),
+                            &outbox_key(enum_unwrap!(&time.id, FeedId:: Local(_, id) => id)),
                             true,
                         ).unwrap(),
                         IdbCursorDirection::Prev
@@ -323,8 +257,8 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
 
                 // Combine and send
                 eg.event(|pc| {
-                    let mut mut_ = self1.0.mut_.borrow_mut();
-                    let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                    let mut_ = self1.0.mut_.borrow();
+                    let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                         return;
                     };
                     parent.respond_entries_before(&None, &time, finish_entries(pc, before), early_stop);
@@ -341,8 +275,6 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                 let txn =
                     self1
                         .0
-                        .state
-                        .0
                         .db
                         .transaction_on_multi_with_mode(&[TABLE_OUTBOX], web_sys::IdbTransactionMode::Readonly)
                         .context("Failed to start transaction")?;
@@ -358,7 +290,7 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
                         cursor
                     ) = outbox.open_cursor_with_range_and_direction(
                         &IdbKeyRange::lower_bound_with_open(
-                            &outbox_key(&enum_unwrap!(time.id, FeedId:: Local(_, id) => id)),
+                            &outbox_key(enum_unwrap!(&time.id, FeedId:: Local(_, id) => id)),
                             true,
                         ).unwrap(),
                         IdbCursorDirection::Next
@@ -386,8 +318,8 @@ impl Feed<Option<ChannelId>, FeedTime> for OutboxFeed {
 
                 // Combine and send
                 eg.event(|pc| {
-                    let mut mut_ = self1.0.mut_.borrow_mut();
-                    let Some(parent) = mut_.parent.and_then(|p| p.upgrade()) else {
+                    let mut_ = self1.0.mut_.borrow();
+                    let Some(parent) = mut_.parent.as_ref().and_then(|p| p.upgrade()) else {
                         return;
                     };
                     parent.respond_entries_after(&None, &time, finish_entries(pc, after), late_stop);

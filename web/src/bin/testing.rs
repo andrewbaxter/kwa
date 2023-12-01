@@ -8,9 +8,7 @@ use std::{
     },
 };
 use chrono::{
-    DateTime,
     Utc,
-    NaiveDateTime,
 };
 use gloo::timers::{
     callback::{
@@ -41,7 +39,6 @@ use web::{
     html::hbox,
     logn,
     logd,
-    bb,
 };
 
 fn main() {
@@ -86,7 +83,7 @@ fn main() {
         }
 
         impl Entry<DemoId> for DemoEntry {
-            fn create_el(&self, pc: &mut ProcessingContext) -> El {
+            fn create_el(&self, _pc: &mut ProcessingContext) -> El {
                 return el("div")
                     .classes(&["testing_entry"])
                     .text(&format!("{} {}", self.t.1, self.t.0 as f64 / 1000.))

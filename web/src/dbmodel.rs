@@ -1,8 +1,8 @@
+use std::rc::Rc;
 use chrono::{
     DateTime,
     Utc,
 };
-use futures::Future;
 use gloo::utils::format::JsValueSerdeExt;
 use indexed_db_futures::{
     IdbDatabase,
@@ -14,7 +14,6 @@ use indexed_db_futures::{
     idb_object_store::{
         IdbObjectStore,
     },
-    idb_transaction::IdbTransaction,
     IdbKeyPath,
 };
 use serde::{
@@ -22,7 +21,6 @@ use serde::{
     Deserialize,
 };
 use wasm_bindgen::JsValue;
-use web_sys::IdbTransactionMode;
 use crate::{
     util::{
         MyErrorDomException,
@@ -38,7 +36,7 @@ pub const TABLE_OUTBOX: &'static str = "outbox";
 pub const TABLE_OUTBOX_INDEX_SENT: &'static str = "sent";
 pub const TABLE_OUTBOX_INDEX_STAMP: &'static str = "stamp";
 
-pub async fn new_db() -> Result<IdbDatabase, String> {
+pub async fn new_db() -> Result<Rc<IdbDatabase>, String> {
     let mut db_req: OpenDbRequest = IdbDatabase::open_u32("main", 1).context("Error opening database")?;
     db_req.set_on_upgrade_needed(Some(|evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
         if evt.db().object_store_names().find(|n| n == TABLE_OUTBOX).is_none() {
@@ -48,7 +46,7 @@ pub async fn new_db() -> Result<IdbDatabase, String> {
         }
         Ok(())
     }));
-    return Ok(db_req.await.context("Error waiting for database to open")?);
+    return Ok(Rc::new(db_req.await.context("Error waiting for database to open")?));
 }
 
 #[derive(Serialize, Deserialize)]
