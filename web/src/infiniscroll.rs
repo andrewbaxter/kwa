@@ -187,9 +187,9 @@ impl<FeedId, Id> ContainerEntry for EntryState<FeedId, Id> {
 /// methods.
 pub trait Feed<FeedId, Time: TimeTraits> {
     fn set_parent(&self, parent: WeakInfiniscroll<FeedId, Time>);
-    fn request_around(&self, pc: &mut ProcessingContext, time: Time, count: usize);
-    fn request_before(&self, pc: &mut ProcessingContext, time: Time, count: usize);
-    fn request_after(&self, pc: &mut ProcessingContext, time: Time, count: usize);
+    fn request_around(&self, eg: EventGraph, time: Time, count: usize);
+    fn request_before(&self, eg: EventGraph, time: Time, count: usize);
+    fn request_after(&self, eg: EventGraph, time: Time, count: usize);
 }
 
 struct FeedState<FeedId, Time> {
@@ -521,7 +521,7 @@ impl<FeedId: FeedIdTraits, Id: TimeTraits> WeakInfiniscroll<FeedId, Id> {
 pub struct Infiniscroll<FeedId: FeedIdTraits, Id: TimeTraits>(Rc<RefCell<Infiniscroll_<FeedId, Id>>>);
 
 impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, TimeT> {
-    pub fn new(eg: EventGraph, reset_id: TimeT, feeds: HashMap<FeedIdT, Box<dyn Feed<FeedIdT, TimeT>>>) -> Self {
+    pub fn new(eg: &EventGraph, reset_id: TimeT, feeds: HashMap<FeedIdT, Box<dyn Feed<FeedIdT, TimeT>>>) -> Self {
         let outer_stack = stack().classes(&["infinite"]);
         let frame = el("div").classes(&["frame"]);
         let content = el("div").classes(&["content"]);
@@ -545,7 +545,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
             ],
         );
         let state = Infiniscroll(Rc::new(RefCell::new(Infiniscroll_ {
-            eg: eg,
+            eg: eg.clone(),
             reset_time: reset_id,
             outer_stack: outer_stack,
             frame: frame.clone(),
@@ -723,7 +723,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                     // Changed; clean up old sticky entry
                     if let Some(f) = &self1.reserve_sticky_entry {
                         changed = true;
-                        f.entry_el.ref_remove();
+                        f.entry_el.ref_replace(vec![]);
                     }
                 }
             }
@@ -766,7 +766,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
             self1.want_sticky = None;
             if let Some(s) = self1.reserve_sticky_entry.take() {
                 changed = true;
-                s.entry_el.ref_remove();
+                s.entry_el.ref_replace(vec![]);
             }
         }
         if changed {
@@ -855,7 +855,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                     if let Some(f) = &self1.reserve_sticky_entry {
                         if f.entry.time() == entry.time() {
                             let real1 = self1.reserve_sticky_entry.take().unwrap();
-                            real1.entry_el.ref_remove();
+                            real1.entry_el.ref_replace(vec![]);
                             real = Some(real1);
                         }
                     }
@@ -865,7 +865,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                         );
                     self1.real.el().ref_push(real.entry_el.clone());
                     let height = real.entry_el.offset_height();
-                    real.entry_el.ref_remove();
+                    real.entry_el.ref_replace(vec![]);
                     used_early += height;
                     logn!("realize pre; id {:?}; height {} -> {}", real.entry.time(), height, used_early);
                     realized_early.push(real);
@@ -924,7 +924,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                     if let Some(f) = &self1.reserve_sticky_entry {
                         if f.entry.time() == entry.time() {
                             let real1 = self1.reserve_sticky_entry.take().unwrap();
-                            real1.entry_el.ref_remove();
+                            real1.entry_el.ref_replace(vec![]);
                             real = Some(real1);
                         }
                     }
@@ -934,7 +934,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                         );
                     self1.content.ref_push(real.entry_el.clone());
                     let height = real.entry_el.offset_height();
-                    real.entry_el.ref_remove();
+                    real.entry_el.ref_replace(vec![]);
                     used_late += height;
                     logn!("realize post; id {:?}; height {} -> {}", real.entry.time(), height, used_late);
                     realized_late.push(real);
@@ -1008,7 +1008,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
             let mut requesting_late = false;
             for (feed_id, f_state) in &mut self1.feeds {
                 if f_state.initial {
-                    f_state.feed.request_around(pc, self1.reset_time.clone(), REQUEST_COUNT);
+                    f_state.feed.request_around(pc.eg(), self1.reset_time.clone(), REQUEST_COUNT);
                     requesting_early = true;
                     requesting_late = true;
                 } else {
@@ -1019,7 +1019,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                     if !f_state.early_stop && f_state.early_reserve.len() < MIN_RESERVE {
                         let pivot = get_pivot_early(&self1.real, feed_id, f_state).unwrap();
                         logn!("request early (pivot {:?})", pivot);
-                        f_state.feed.request_before(pc, pivot, REQUEST_COUNT);
+                        f_state.feed.request_before(pc.eg(), pivot, REQUEST_COUNT);
                         requesting_early = true;
                     }
                     if f_state.late_reserve.len() > MAX_RESERVE {
@@ -1030,7 +1030,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                     if !f_state.late_stop && f_state.late_reserve.len() < MIN_RESERVE {
                         let pivot = get_pivot_late(&self1.real, feed_id, f_state).unwrap();
                         logn!("request late (pivot {:?})", pivot);
-                        f_state.feed.request_after(pc, pivot, REQUEST_COUNT);
+                        f_state.feed.request_after(pc.eg(), pivot, REQUEST_COUNT);
                         requesting_late = true;
                     }
                 }
@@ -1478,7 +1478,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
                         }
                         if stop && !inferred_stop {
                             let pivot = get_pivot_late(&self1.real, feed_id, feed_state).unwrap();
-                            feed_state.feed.request_after(pc, pivot, REQUEST_COUNT)
+                            feed_state.feed.request_after(pc.eg(), pivot, REQUEST_COUNT)
                         }
                     }
                     else {
@@ -1500,7 +1500,7 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
     /// Called by feed when notified of new entries, to decide if the view is in a
     /// state where it can accept more entries. Returns a pivot if new entries are
     /// acceptable.
-    pub fn want_after(&self, feed_id: FeedIdT, entry_id: TimeT) -> Option<TimeT> {
+    pub fn want_after(&self, feed_id: FeedIdT, entry_id: TimeT) -> Option<(TimeT, usize)> {
         let mut self1 = self.0.borrow_mut();
         let self1 = &mut *self1;
         let f_state = self1.feeds.get_mut(&feed_id).unwrap();
@@ -1512,6 +1512,6 @@ impl<FeedIdT: FeedIdTraits, TimeT: TimeTraits + 'static> Infiniscroll<FeedIdT, T
         if !f_state.late_stop {
             return None;
         }
-        return Some(get_pivot_late(&self1.real, &feed_id, f_state).unwrap());
+        return Some((get_pivot_late(&self1.real, &feed_id, f_state).unwrap(), REQUEST_COUNT));
     }
 }

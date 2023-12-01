@@ -4,6 +4,7 @@ use lunk::{
     Prim,
 };
 use wasm_bindgen::JsValue;
+use web::world::FeedId;
 use super::{
     viewid::{
         ChannelViewStateId,
@@ -136,11 +137,11 @@ pub fn set_view_(pc: &mut ProcessingContext, state: &State, id: &ViewStateId) ->
 pub fn set_view_message(pc: &mut ProcessingContext, state: &State, message_time: FeedTime) {
     let channel_id;
     match &message_time.id {
-        super::viewid::FeedId::None => panic!(),
-        super::viewid::FeedId::Local(c, _) => {
+        FeedId::None => panic!(),
+        FeedId::Local(c, _) => {
             channel_id = c.clone();
         },
-        super::viewid::FeedId::Real(i) => {
+        FeedId::Real(i) => {
             channel_id = i.0.clone();
         },
     }
@@ -152,8 +153,7 @@ pub fn set_view_message(pc: &mut ProcessingContext, state: &State, message_time:
         ViewState::Messages(m) => {
             match &*m.borrow() {
                 MessagesViewMode::Brew(b) => {
-                    let brew = state.0.brews.get_immediate(&b.id).unwrap();
-                    if brew.channels.borrow_values().iter().any(|id| id == &channel_id) {
+                    if state.0.channel_feeds.borrow().iter().any(|f| f.channel() == &channel_id) {
                         &ViewStateId::Brew(BrewViewStateId {
                             id: b.id.clone(),
                             channel: b.channel.borrow().map(|c| ChannelViewStateId {

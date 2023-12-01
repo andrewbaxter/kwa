@@ -19,6 +19,14 @@ pub struct ChannelId(pub IdentityId, pub u16);
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub struct MessageId(pub ChannelId, pub u64);
 
+/// Not sent over wire
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize)]
+pub enum FeedId {
+    None,
+    Local(ChannelId, String),
+    Real(MessageId),
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub struct DateMessageId(pub DateTime<Utc>, pub MessageId);
 
@@ -64,7 +72,7 @@ pub enum U2SGet {
     GetBrews,
     GetOwnIdentities,
     EventsGetAfter {
-        id: MessageId,
+        id: Option<MessageId>,
         count: u64,
     },
     SnapGetAround {

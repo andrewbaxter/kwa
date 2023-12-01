@@ -32,10 +32,10 @@ web-sys = { version = "0.3.64", features = [
 ] }
 serde-wasm-bindgen = "0.5.0"
 serde_json = "1.0.104"
-serde = "1.0.181"
+serde = { version = "1.0.181", features = ["derive"] }
 strum_macros = "0.25.1"
 lunk = { version = "0.1.2", path = "../../linkos" }
-gloo = { version = "0.10.0", features = ["futures"] }
+gloo = { version = "0.10.0", features = ["futures", "utils"] }
 wasm-bindgen-futures = "0.4.37"
 urlencoding = "2.1.3"
 console_error_panic_hook = "0.1.7"
@@ -44,6 +44,7 @@ rooting = "0.1.6"
 rooting-forms = "0.0.1"
 caches = "0.2.7"
 futures = "0.3.29"
+indexed_db_futures = "0.4.1"
 
 [profile.release]
 debug = true

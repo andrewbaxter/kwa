@@ -1,3 +1,14 @@
+//! This is a combined collection/cache with multiple purposes:
+//!
+//! 1. Ensure there's only one instance of live objects (channels/brews) so that updates
+//!    are propagated to all users
+//!
+//! 2. Render immediately, rather than a blank frame before the async + post-async
+//!    refresh, if there's data
+//!
+//! 3. Unified interface for async data
+//!
+//! 4. Caching
 use std::{
     rc::{
         Weak,
@@ -35,17 +46,17 @@ pub trait NowOrLaterValue: 'static + Clone { }
 impl<K: 'static + Clone> NowOrLaterValue for K { }
 
 pub enum NowOrLater<K: NowOrLaterKey, V: NowOrLaterValue> {
-    Now(Soft<K, V>),
-    Later(Receiver<Soft<K, V>>),
+    Now(Hard<K, V>),
+    Later(Receiver<Hard<K, V>>),
 }
 
-struct Soft_<K: NowOrLaterKey, V: NowOrLaterValue> {
-    noler: Weak<NowOrLaterer_<K, V>>,
+struct Hard_<K: NowOrLaterKey, V: NowOrLaterValue> {
+    noler: Weak<NowOrLaterCollection_<K, V>>,
     k: K,
     v: Option<V>,
 }
 
-impl<K: NowOrLaterKey, V: NowOrLaterValue> Drop for Soft_<K, V> {
+impl<K: NowOrLaterKey, V: NowOrLaterValue> Drop for Hard_<K, V> {
     fn drop(&mut self) {
         let Some(noler) = self.noler.upgrade() else {
             return;
@@ -55,12 +66,13 @@ impl<K: NowOrLaterKey, V: NowOrLaterValue> Drop for Soft_<K, V> {
     }
 }
 
-/// Soft (vs weak) reference. Helper wrapper for managing live map + dead cache to
-/// provide soft reference functionality.
+/// Hard (from soft, vs weak) reference. Helper wrapper for managing live map +
+/// dead cache to provide soft reference functionality. This must be kept around as
+/// long as the value is in use.
 #[derive(Clone)]
-pub struct Soft<K: NowOrLaterKey, V: NowOrLaterValue>(Rc<Soft_<K, V>>);
+pub struct Hard<K: NowOrLaterKey, V: NowOrLaterValue>(Rc<Hard_<K, V>>);
 
-impl<K: NowOrLaterKey, V: NowOrLaterValue> Deref for Soft<K, V> {
+impl<K: NowOrLaterKey, V: NowOrLaterValue> Deref for Hard<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -68,20 +80,20 @@ impl<K: NowOrLaterKey, V: NowOrLaterValue> Deref for Soft<K, V> {
     }
 }
 
-struct NowOrLaterer_<K: NowOrLaterKey, V: NowOrLaterValue> {
+struct NowOrLaterCollection_<K: NowOrLaterKey, V: NowOrLaterValue> {
     unused: RefCell<WTinyLFUCache<K, V>>,
-    used: RefCell<HashMap<K, Weak<Soft_<K, V>>>>,
+    used: RefCell<HashMap<K, Weak<Hard_<K, V>>>>,
     get: Box<dyn Fn(K) -> Pin<Box<dyn Future<Output = Result<V, String>>>>>,
     in_flight: RefCell<HashSet<K>>,
-    pending: RefCell<HashMap<K, Vec<Sender<Soft<K, V>>>>>,
+    pending: RefCell<HashMap<K, Vec<Sender<Hard<K, V>>>>>,
 }
 
 #[derive(Clone)]
-pub struct NowOrLaterer<K: NowOrLaterKey, V: NowOrLaterValue>(Rc<NowOrLaterer_<K, V>>);
+pub struct NowOrLaterCollection<K: NowOrLaterKey, V: NowOrLaterValue>(Rc<NowOrLaterCollection_<K, V>>);
 
-impl<K: NowOrLaterKey, V: NowOrLaterValue> NowOrLaterer<K, V> {
+impl<K: NowOrLaterKey, V: NowOrLaterValue> NowOrLaterCollection<K, V> {
     pub fn new(f: impl 'static + Fn(K) -> Pin<Box<dyn Future<Output = Result<V, String>>>>) -> Self {
-        return NowOrLaterer(Rc::new(NowOrLaterer_ {
+        return NowOrLaterCollection(Rc::new(NowOrLaterCollection_ {
             unused: RefCell::new(WTinyLFUCache::<K, V>::builder().set_window_cache_size(100).finalize().unwrap()),
             used: Default::default(),
             get: Box::new(f),
@@ -90,12 +102,12 @@ impl<K: NowOrLaterKey, V: NowOrLaterValue> NowOrLaterer<K, V> {
         }));
     }
 
-    pub fn get_immediate(&self, k: &K) -> Option<Soft<K, V>> {
+    pub fn get_immediate(&self, k: &K) -> Option<Hard<K, V>> {
         if let Some(v) = self.0.used.borrow().get(&k) {
-            return Some(Soft(v.upgrade().unwrap()));
+            return Some(Hard(v.upgrade().unwrap()));
         };
         if let Some(v) = self.0.unused.borrow_mut().remove(&k) {
-            let out = Soft(Rc::new(Soft_ {
+            let out = Hard(Rc::new(Hard_ {
                 noler: Rc::downgrade(&self.0),
                 k: k.clone(),
                 v: Some(v),
@@ -104,6 +116,17 @@ impl<K: NowOrLaterKey, V: NowOrLaterValue> NowOrLaterer<K, V> {
             return Some(out);
         }
         return None;
+    }
+
+    pub async fn get_async(&self, k: K) -> Result<Hard<K, V>, String> {
+        match self.get(k) {
+            NowOrLater::Now(v) => Ok(v),
+            NowOrLater::Later(l) => {
+                // Senders are owned by this, and this can't be dropped while get_async is
+                // operating
+                return Ok(l.await.unwrap());
+            },
+        }
     }
 
     pub fn get(&self, k: K) -> NowOrLater<K, V> {
@@ -131,9 +154,9 @@ impl<K: NowOrLaterKey, V: NowOrLaterValue> NowOrLaterer<K, V> {
         return NowOrLater::Later(recv);
     }
 
-    pub fn set(&self, k: K, v: V) -> Soft<K, V> {
+    pub fn set(&self, k: K, v: V) -> Hard<K, V> {
         self.0.in_flight.borrow_mut().remove(&k);
-        let out = Soft(Rc::new(Soft_ {
+        let out = Hard(Rc::new(Hard_ {
             noler: Rc::downgrade(&self.0),
             k: k.clone(),
             v: Some(v),

@@ -35,6 +35,7 @@ use serde::{
 };
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::DomException;
 
 pub trait MoreMath {
     fn mix<T: Copy + Sub<Output = T> + Add<Output = T> + Mul<f64, Output = T>>(self, a: T, b: T) -> T;
@@ -118,6 +119,34 @@ impl<T, E: Display> MyError<T> for Result<T, E> {
     }
 }
 
+impl<T> MyError<T> for Option<T> {
+    fn log_ignore(self, context: &str) {
+        match self {
+            Some(_) => { },
+            None => {
+                log!("{}: missing value", context);
+            },
+        }
+    }
+
+    fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String> {
+        match self {
+            Some(v) => return Ok(v),
+            None => {
+                log!("{}: missing value", context);
+                return Err(replacement.to_string());
+            },
+        }
+    }
+
+    fn context(self, context: &str) -> Result<T, String> {
+        match self {
+            Some(v) => return Ok(v),
+            None => return Err(format!("{}: missing value", context)),
+        };
+    }
+}
+
 pub trait MyErrorJsValue<T> {
     fn log_ignore(self, context: &str);
     fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String>;
@@ -152,21 +181,27 @@ impl<T> MyErrorJsValue<T> for Result<T, JsValue> {
     }
 }
 
-impl<T> MyError<T> for Option<T> {
+pub trait MyErrorDomException<T> {
+    fn log_ignore(self, context: &str);
+    fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String>;
+    fn context(self, context: &str) -> Result<T, String>;
+}
+
+impl<T> MyErrorDomException<T> for Result<T, DomException> {
     fn log_ignore(self, context: &str) {
         match self {
-            Some(_) => { },
-            None => {
-                log!("{}: missing value", context);
+            Ok(_) => { },
+            Err(e) => {
+                log!("{}: {:?}", context, e.as_string());
             },
         }
     }
 
     fn log_replace(self, context: &str, replacement: impl ToString) -> Result<T, String> {
         match self {
-            Some(v) => return Ok(v),
-            None => {
-                log!("{}: missing value", context);
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                log!("{}: {:?}", context, e.as_string());
                 return Err(replacement.to_string());
             },
         }
@@ -174,8 +209,8 @@ impl<T> MyError<T> for Option<T> {
 
     fn context(self, context: &str) -> Result<T, String> {
         match self {
-            Some(v) => return Ok(v),
-            None => return Err(format!("{}: missing value", context)),
+            Ok(v) => return Ok(v),
+            Err(e) => return Err(format!("{}: {:?}", context, e.as_string())),
         };
     }
 }
@@ -220,12 +255,12 @@ pub fn session_state<
     return (p, drop);
 }
 
-pub fn bg<F: 'static + Future<Output = Result<(), String>>>(f: F) {
+pub fn bg<F: 'static + Future<Output = Result<(), String>>>(context: &'static str, f: F) {
     spawn_local(async move {
         match f.await {
             Ok(_) => { },
             Err(e) => {
-                log!("Background activity failed with error: {}", e);
+                log!("Background activity failed with error - {}: {}", context, e);
             },
         };
     });
@@ -240,14 +275,21 @@ impl Drop for RootedSpawn {
 }
 
 /// Spawn an async task that will be cancelled if the returned value is dropped.
-pub fn spawn_rooted<F: 'static + Future<Output = ()>>(task: F) -> ScopeValue {
+pub fn spawn_rooted<F: 'static + Future<Output = Result<(), String>>>(desc: &'static str, task: F) -> ScopeValue {
     let (send_die, mut recv_die) = channel();
     spawn_local(async move {
         let mut task = pin!(task.fuse());
 
         select!{
             _ = recv_die =>(),
-            _ = task =>(),
+            r = task => {
+                match r {
+                    Ok(_) => { },
+                    Err(e) => {
+                        log!("Rooted background task [{}] failed: {}", desc, e);
+                    },
+                }
+            },
         };
     });
     return scope_any(RootedSpawn(Some(send_die)));

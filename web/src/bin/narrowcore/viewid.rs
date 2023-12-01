@@ -10,14 +10,8 @@ use web::world::{
     ChannelId,
     BrewId,
     MessageId,
+    FeedId,
 };
-
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize)]
-pub enum FeedId {
-    None,
-    Local(ChannelId, String),
-    Real(MessageId),
-}
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize)]
 pub struct FeedTime {

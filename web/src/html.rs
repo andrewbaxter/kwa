@@ -13,10 +13,13 @@ use rooting::{
     El,
 };
 use wasm_bindgen_futures::spawn_local;
-use crate::noworlater::{
-    NowOrLaterKey,
-    NowOrLaterValue,
-    NowOrLater,
+use crate::{
+    noworlater::{
+        NowOrLaterKey,
+        NowOrLaterValue,
+        NowOrLater,
+    },
+    util::spawn_rooted,
 };
 
 pub const CSS_HIDE: &'static str = "hide";
@@ -113,6 +116,22 @@ pub fn bound_list<
             e.ref_splice(c.offset, c.remove, c.add.iter().map(|e| map_child(pc, e)).collect());
         }
     }));
+}
+
+pub fn async_block<F: 'static + Future<Output = Result<Vec<El>, String>>>(desc: &'static str, task: F) -> El {
+    return el("div").classes(&["async_block"]).own(|e| {
+        spawn_rooted(desc, {
+            let e = e.weak();
+            async move {
+                let e2 = task.await?;
+                let Some(e) = e.upgrade() else {
+                    return Ok(());
+                };
+                e.ref_replace(e2);
+                return Ok(());
+            }
+        })
+    });
 }
 
 #[derive(Clone, PartialEq)]

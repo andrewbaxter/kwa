@@ -5,12 +5,14 @@ use std::{
     cell::RefCell,
 };
 use chrono::Utc;
+use indexed_db_futures::IdbDatabase;
 use lunk::{
     Prim,
     ProcessingContext,
     List,
     EventGraph,
 };
+use rooting::ScopeValue;
 use web::{
     world::{
         World,
@@ -20,7 +22,7 @@ use web::{
         U2SGet,
         S2UChannel,
     },
-    noworlater::NowOrLaterer,
+    noworlater::NowOrLaterCollection,
 };
 use super::{
     view::{
@@ -29,9 +31,9 @@ use super::{
         Channel,
     },
     messagefeed::{
-        OutboxFeed,
         ChannelFeed,
     },
+    outboxfeed::OutboxFeed,
 };
 
 /// A non-session-persisted view state (menu, dialog, etc).
@@ -43,6 +45,7 @@ pub enum TempViewState {
 }
 
 pub struct State_ {
+    pub db: IdbDatabase,
     pub eg: EventGraph,
     pub local_id_base: i64,
     pub local_id_counter: AtomicI16,
@@ -50,18 +53,20 @@ pub struct State_ {
     pub need_auth: Prim<bool>,
     pub view: Prim<ViewState>,
     pub temp_view: Prim<Option<TempViewState>>,
-    pub brews: NowOrLaterer<BrewId, Brew>,
-    pub channels: NowOrLaterer<ChannelId, Channel>,
-    pub outbox_feeds: RefCell<Vec<Box<OutboxFeed>>>,
-    pub channel_feeds: RefCell<Vec<Box<ChannelFeed>>>,
+    pub brews: NowOrLaterCollection<BrewId, Brew>,
+    pub channels: NowOrLaterCollection<ChannelId, Channel>,
+    pub outbox_feed: RefCell<Option<OutboxFeed>>,
+    pub channel_feeds: RefCell<Vec<ChannelFeed>>,
+    pub sending: RefCell<Option<ScopeValue>>,
 }
 
 #[derive(Clone)]
 pub struct State(pub Rc<State_>);
 
 impl State {
-    pub fn new(pc: &mut ProcessingContext, world: &World) -> State {
+    pub fn new(pc: &mut ProcessingContext, db: IdbDatabase, world: &World) -> State {
         return State(Rc::new(State_ {
+            db: db,
             eg: pc.eg(),
             local_id_base: Utc::now().timestamp_micros(),
             local_id_counter: AtomicI16::new(0),
@@ -69,7 +74,7 @@ impl State {
             need_auth: Prim::new(pc, false),
             view: Prim::new(pc, ViewState::Channels),
             temp_view: Prim::new(pc, None),
-            brews: NowOrLaterer::new({
+            brews: NowOrLaterCollection::new({
                 let world = world.clone();
                 let eg = pc.eg();
                 move |k: BrewId| {
@@ -88,7 +93,7 @@ impl State {
                     })
                 }
             }),
-            channels: NowOrLaterer::new({
+            channels: NowOrLaterCollection::new({
                 let world = world.clone();
                 let eg = pc.eg();
                 move |k: ChannelId| {
@@ -106,8 +111,9 @@ impl State {
                     })
                 }
             }),
-            outbox_feeds: RefCell::new(vec![]),
+            outbox_feed: RefCell::new(None),
             channel_feeds: RefCell::new(vec![]),
+            sending: RefCell::new(None),
         }));
     }
 }

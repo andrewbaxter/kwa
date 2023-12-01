@@ -19,6 +19,10 @@ use gloo::timers::{
     future::TimeoutFuture,
 };
 use js_sys::Math::random;
+use lunk::{
+    ProcessingContext,
+    EventGraph,
+};
 use rooting::{
     set_root,
     el,
@@ -47,14 +51,14 @@ fn main() {
         #[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Debug, Hash)]
         struct DemoId(i64, &'static str);
 
-        struct DemoFeedShared {
+        struct DemoFeedMut {
             parent: Option<WeakInfiniscroll<i32, DemoId>>,
-            name: &'static str,
             start: i64,
             hist: Vec<i64>,
+            _generate: Option<Interval>,
         }
 
-        impl DemoFeedShared {
+        impl DemoFeedMut {
             fn find(&self, pivot: i64) -> Option<usize> {
                 let mut last = None;
                 for (i, e) in self.hist.iter().enumerate() {
@@ -68,12 +72,12 @@ fn main() {
         }
 
         struct DemoEntry {
-            feed: Rc<RefCell<DemoFeedShared>>,
             t: DemoId,
+            feed: DemoFeed,
         }
 
         impl DemoEntry {
-            fn new(feed: &Rc<RefCell<DemoFeedShared>>, i: DemoId) -> Rc<dyn Entry<DemoId>> {
+            fn new(feed: &DemoFeed, i: DemoId) -> Rc<dyn Entry<DemoId>> {
                 return Rc::new(DemoEntry {
                     feed: feed.clone(),
                     t: i,
@@ -82,7 +86,7 @@ fn main() {
         }
 
         impl Entry<DemoId> for DemoEntry {
-            fn create_el(&self) -> El {
+            fn create_el(&self, pc: &mut ProcessingContext) -> El {
                 return el("div")
                     .classes(&["testing_entry"])
                     .text(&format!("{} {}", self.t.1, self.t.0 as f64 / 1000.))
@@ -94,7 +98,7 @@ fn main() {
                             logn!("clickoo");
                             let Some(parent) =
                             //. .
-                            & feed.borrow().parent else {
+                            & feed.0.mut_.borrow().parent else {
                                 return;
                             };
                             let Some(parent) = parent.upgrade() else {
@@ -118,70 +122,82 @@ fn main() {
             }
         }
 
-        struct DemoFeed {
+        struct DemoFeed_ {
             id: i32,
-            shared: Rc<RefCell<DemoFeedShared>>,
-            _generate: Option<Interval>,
+            name: &'static str,
+            mut_: RefCell<DemoFeedMut>,
         }
 
+        #[derive(Clone)]
+        struct DemoFeed(Rc<DemoFeed_>);
+
         impl DemoFeed {
-            fn new(id: i32, name: &'static str, initial_count: usize, generate_interval: Option<u32>) -> Self {
+            fn new(
+                eg: &EventGraph,
+                id: i32,
+                name: &'static str,
+                initial_count: usize,
+                generate_interval: Option<u32>,
+            ) -> Self {
                 let start = Utc::now().timestamp_millis();
                 let mut hist = vec![];
                 for i in 0 .. initial_count {
                     hist.push((-(initial_count as i64) + i as i64) * 1000);
                 }
-                let shared = Rc::new(RefCell::new(DemoFeedShared {
-                    parent: None,
-                    name: name,
-                    start: start,
-                    hist: hist,
-                }));
-                return DemoFeed {
+                let out = DemoFeed(Rc::new(DemoFeed_ {
                     id: id,
-                    shared: shared.clone(),
-                    _generate: generate_interval.map(|interval| Interval::new(interval, {
-                        let shared = Rc::downgrade(&shared);
-                        move || {
-                            let parent;
-                            let i;
-                            {
-                                let Some(shared) = shared.upgrade() else {
-                                    return;
-                                };
-                                let mut shared1 = shared.borrow_mut();
-                                let shared1 = &mut *shared1;
-                                let Some(parent0) =
-                                //. .
-                                & shared1.parent else {
-                                    return;
-                                };
-                                let Some(parent0) = parent0.upgrade() else {
-                                    return;
-                                };
-                                parent = parent0;
-                                let time = Utc::now().timestamp_millis() - shared1.start;
-                                shared1.hist.push(time);
-                                i = DemoId(time, shared1.name);
-                            }
-                            parent.notify_entry_after(id, i);
+                    name: name,
+                    mut_: RefCell::new(DemoFeedMut {
+                        parent: None,
+                        start: start,
+                        hist: hist,
+                        _generate: None,
+                    }),
+                }));
+                out.0.mut_.borrow_mut()._generate = generate_interval.map(|interval| Interval::new(interval, {
+                    let self1 = Rc::downgrade(&out.0);
+                    let eg = eg.clone();
+                    move || {
+                        let Some(self1) = self1.upgrade() else {
+                            return;
+                        };
+                        let self1 = DemoFeed(self1);
+                        let parent;
+                        let i;
+                        {
+                            let mut mut_ = self1.0.mut_.borrow_mut();
+                            let mut_ = &mut *mut_;
+                            let Some(parent0) =
+                            //. .
+                            & mut_.parent else {
+                                return;
+                            };
+                            let Some(parent0) = parent0.upgrade() else {
+                                return;
+                            };
+                            parent = parent0;
+                            let time = Utc::now().timestamp_millis() - mut_.start;
+                            mut_.hist.push(time);
+                            i = DemoId(time, self1.0.name);
                         }
-                    })),
-                };
+                        if let Some((pivot, count)) = parent.want_after(id, i) {
+                            self1.request_after(eg.clone(), pivot, count);
+                        }
+                    }
+                }));
+                return out;
             }
         }
 
         impl Feed<i32, DemoId> for DemoFeed {
             fn set_parent(&self, parent: WeakInfiniscroll<i32, DemoId>) {
-                self.shared.borrow_mut().parent = Some(parent);
+                self.0.mut_.borrow_mut().parent = Some(parent);
             }
 
-            fn request_around(&self, pivot: DemoId, count: usize) {
-                let self1 = self.shared.borrow();
-                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
-                let id_in_parent = self.id;
-                let i = self1.find(pivot.0);
-                let name = self1.name;
+            fn request_around(&self, _eg: EventGraph, pivot: DemoId, count: usize) {
+                let mut_ = self.0.mut_.borrow();
+                let parent = mut_.parent.as_ref().unwrap().upgrade().unwrap();
+                let i = mut_.find(pivot.0);
                 let out;
                 let early_stop;
                 let late_stop;
@@ -196,14 +212,14 @@ fn main() {
                             early_stop = false;
                             early = i - count;
                         }
-                        if i + count >= self1.hist.len() {
+                        if i + count >= mut_.hist.len() {
                             late_stop = true;
-                            late = self1.hist.len();
+                            late = mut_.hist.len();
                         } else {
                             late_stop = false;
                             late = i + count;
                         }
-                        out = self1.hist[early .. late].to_vec();
+                        out = mut_.hist[early .. late].to_vec();
                     },
                     None => {
                         early_stop = true;
@@ -212,15 +228,15 @@ fn main() {
                     },
                 }
                 spawn_local({
-                    let shared = self.shared.clone();
+                    let self1 = self.clone();
                     async move {
                         TimeoutFuture::new((random() * 1000. + 4000.) as u32).await;
 
                         //. TimeoutFuture::new(0).await;
                         parent.respond_entries_around(
-                            id_in_parent,
+                            self1.0.id,
                             pivot,
-                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
+                            out.into_iter().map(|t| DemoEntry::new(&self1, DemoId(t, self1.0.name))).collect(),
                             early_stop,
                             late_stop,
                         );
@@ -228,12 +244,10 @@ fn main() {
                 });
             }
 
-            fn request_before(&self, pivot: DemoId, count: usize) {
-                let self1 = self.shared.borrow();
-                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
-                let id_in_parent = self.id;
-                let i = self1.find(pivot.0);
-                let name = self1.name;
+            fn request_before(&self, _eg: EventGraph, pivot: DemoId, count: usize) {
+                let mut_ = self.0.mut_.borrow();
+                let parent = mut_.parent.as_ref().unwrap().upgrade().unwrap();
+                let i = mut_.find(pivot.0);
                 let out;
                 let early_stop;
                 match i {
@@ -246,7 +260,7 @@ fn main() {
                             early_stop = false;
                             early = i - count;
                         }
-                        out = self1.hist[early .. i].to_vec();
+                        out = mut_.hist[early .. i].to_vec();
                     },
                     None => {
                         early_stop = true;
@@ -254,40 +268,42 @@ fn main() {
                     },
                 }
                 spawn_local({
-                    let shared = self.shared.clone();
+                    let self1 = self.clone();
                     async move {
                         TimeoutFuture::new((random() * 1000. + 4000.) as u32).await;
 
                         //. TimeoutFuture::new(0).await;
                         parent.respond_entries_before(
-                            &id_in_parent,
+                            &self1.0.id,
                             &pivot,
-                            out.into_iter().rev().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
+                            out
+                                .into_iter()
+                                .rev()
+                                .map(|t| DemoEntry::new(&self1, DemoId(t, self1.0.name)))
+                                .collect(),
                             early_stop,
                         );
                     }
                 });
             }
 
-            fn request_after(&self, pivot: DemoId, count: usize) {
-                let self1 = self.shared.borrow();
-                let parent = self1.parent.as_ref().unwrap().upgrade().unwrap();
-                let id_in_parent = self.id;
-                let i = self1.find(pivot.0);
-                let name = self1.name;
+            fn request_after(&self, _eg: EventGraph, pivot: DemoId, count: usize) {
+                let mut_ = self.0.mut_.borrow();
+                let parent = mut_.parent.as_ref().unwrap().upgrade().unwrap();
+                let i = mut_.find(pivot.0);
                 let out;
                 let late_stop;
                 match i {
                     Some(i) => {
                         let late;
-                        if i + count >= self1.hist.len() {
+                        if i + count >= mut_.hist.len() {
                             late_stop = true;
-                            late = self1.hist.len();
+                            late = mut_.hist.len();
                         } else {
                             late_stop = false;
                             late = i + count;
                         }
-                        out = self1.hist[i + 1 .. late].to_vec();
+                        out = mut_.hist[i + 1 .. late].to_vec();
                     },
                     None => {
                         late_stop = true;
@@ -296,15 +312,15 @@ fn main() {
                 }
                 logd!("request after, out {:?}", out);
                 spawn_local({
-                    let shared = self.shared.clone();
+                    let self1 = self.clone();
                     async move {
                         TimeoutFuture::new((random() * 1000. + 4000.) as u32).await;
 
                         //. TimeoutFuture::new(0).await;
                         parent.respond_entries_after(
-                            &id_in_parent,
+                            &self1.0.id,
                             &pivot,
-                            out.into_iter().map(|t| DemoEntry::new(&shared, DemoId(t, name))).collect(),
+                            out.into_iter().map(|t| DemoEntry::new(&self1, DemoId(t, self1.0.name))).collect(),
                             late_stop,
                         );
                     }
@@ -315,15 +331,17 @@ fn main() {
         let now = 1000;
 
         //. let inf1 = Infiniscroll::new(now, vec![Box::new(DemoFeed::new("alpha", 1000, Some(5000)))]);
+        let eg = EventGraph::new();
         let inf1 =
             Infiniscroll::new(
+                &eg,
                 DemoId(now, "alpha"),
                 [
-                    Box::new(DemoFeed::new(0, "alpha", 1000, Some(5000))),
-                    Box::new(DemoFeed::new(1, "beta", 500, Some(4500))),
+                    Box::new(DemoFeed::new(&eg, 0, "alpha", 1000, Some(5000))),
+                    Box::new(DemoFeed::new(&eg, 1, "beta", 500, Some(4500))),
                 ]
                     .into_iter()
-                    .map(|f| (f.id, f as Box<dyn Feed<i32, DemoId>>))
+                    .map(|f| (f.0.id, f as Box<dyn Feed<i32, DemoId>>))
                     .collect(),
             );
 
