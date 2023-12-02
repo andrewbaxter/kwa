@@ -44,6 +44,8 @@ pub struct S2SWPush {
 
 #[derive(Serialize, Deserialize)]
 pub enum U2SPost {
+    // Json
+    SubscribePush(String),
     Auth {
         username: String,
         password: String,
@@ -65,6 +67,7 @@ pub enum U2SPost {
 
 #[derive(Serialize, Deserialize)]
 pub enum U2SGet {
+    GetPushPubKey,
     GetBrew(BrewId),
     GetChannel(ChannelId),
     GetIdentity(IdentityId),
@@ -136,6 +139,11 @@ pub struct S2UGetAfterResp {
     pub server_time: MessageId,
     pub entries: Vec<S2UMessage>,
     pub late_stop: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum U2SWPost {
+    Ping,
 }
 
 async fn send_req(req: Request) -> Result<Vec<u8>, String> {

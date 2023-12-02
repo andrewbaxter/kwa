@@ -1,6 +1,11 @@
 use gloo::{
     events::EventListener,
-    utils::window,
+    utils::{
+        window,
+        format::JsValueSerdeExt,
+        document,
+    },
+    timers::callback::Interval,
 };
 use js_sys::{
     JsString,
@@ -15,8 +20,12 @@ use web_sys::{
     Url,
     Blob,
     BlobPropertyBag,
+    ServiceWorkerRegistration,
 };
-use crate::util::MyErrorJsValue;
+use crate::{
+    util::MyErrorJsValue,
+    world::U2SWPost,
+};
 
 #[wasm_bindgen]
 extern "C" {
@@ -28,7 +37,7 @@ extern "C" {
     static IMPORT_META: ImportMeta;
 }
 
-pub async fn install() -> Result<(), String> {
+pub async fn install() -> Result<ServiceWorkerRegistration, String> {
     EventListener::new(&window(), "controllerchange", |_| {
         window().location().reload().unwrap();
     }).forget();
@@ -41,8 +50,21 @@ pub async fn install() -> Result<(), String> {
             ).context("Error creating service worker data url")?,
         ).unwrap();
     JsFuture::from(service_workers.register(data_url.as_str())).await.context("Failed to register service worker")?;
-    JsFuture::from(service_workers.ready().context("Error getting service worker ready future")?)
-        .await
-        .context("Error waiting for service worker to become ready")?;
-    return Ok(());
+    let reg =
+        ServiceWorkerRegistration::from(
+            JsFuture::from(service_workers.ready().context("Error getting service worker ready future")?)
+                .await
+                .context("Error waiting for service worker to become ready")?,
+        );
+    Interval::new(1000, {
+        move || {
+            let Some(c) = window().navigator().service_worker().controller() else {
+                return;
+            };
+            if !document().hidden() {
+                c.post_message(&<JsValue as JsValueSerdeExt>::from_serde(&U2SWPost::Ping).unwrap()).unwrap();
+            }
+        }
+    }).forget();
+    return Ok(reg);
 }

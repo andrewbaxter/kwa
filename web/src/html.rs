@@ -90,6 +90,14 @@ pub fn dialpad_button(icon_id: &str, text: &str, mut cb: impl FnMut() -> () + 's
 pub trait ElExt {
     fn ref_bind_text(&self, pc: &mut ProcessingContext, text: &Prim<String>) -> &Self;
     fn bind_text(self, pc: &mut ProcessingContext, text: &Prim<String>) -> Self;
+    fn bind_list<
+        T: Clone + 'static,
+    >(
+        self,
+        pc: &mut ProcessingContext,
+        list: &List<T>,
+        map_child: impl Fn(&mut ProcessingContext, &T) -> El + 'static,
+    ) -> El;
 }
 
 impl ElExt for El {
@@ -105,17 +113,23 @@ impl ElExt for El {
         self.ref_bind_text(pc, text);
         return self;
     }
-}
 
-pub fn bound_list<
-    T: Clone + 'static,
->(pc: &mut ProcessingContext, list: &List<T>, map_child: impl Fn(&mut ProcessingContext, &T) -> El + 'static) -> El {
-    return el("div").own(|e| link!((pc = pc), (list = list.clone()), (), (e = e.weak(), map_child = map_child) {
-        let e = e.upgrade()?;
-        for c in list.borrow_changes().iter() {
-            e.ref_splice(c.offset, c.remove, c.add.iter().map(|e| map_child(pc, e)).collect());
-        }
-    }));
+    fn bind_list<
+        T: Clone + 'static,
+    >(
+        self,
+        pc: &mut ProcessingContext,
+        list: &List<T>,
+        map_child: impl Fn(&mut ProcessingContext, &T) -> El + 'static,
+    ) -> Self {
+        self.ref_own(|e| link!((pc = pc), (list = list.clone()), (), (e = e.weak(), map_child = map_child) {
+            let e = e.upgrade()?;
+            for c in list.borrow_changes().iter() {
+                e.ref_splice(c.offset, c.remove, c.add.iter().map(|e| map_child(pc, e)).collect());
+            }
+        }));
+        return self;
+    }
 }
 
 pub fn async_block<F: 'static + Future<Output = Result<Vec<El>, String>>>(desc: &'static str, task: F) -> El {

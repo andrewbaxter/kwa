@@ -21,7 +21,10 @@ use gloo::{
     events::EventListener,
 };
 use indexed_db_futures::IdbQuerySource;
-use js_sys::Object;
+use js_sys::{
+    Object,
+    Uint8Array,
+};
 use lunk::{
     link,
     Prim,
@@ -32,6 +35,7 @@ use narrowcore::{
     state::{
         State,
         TempViewState,
+        replace_temp_view,
     },
     view::{
         MessagesViewMode,
@@ -49,7 +53,9 @@ use rooting::{
 use rooting_forms::Form;
 use wasm_bindgen::{
     JsCast,
+    JsValue,
 };
+use wasm_bindgen_futures::JsFuture;
 use web::{
     infiniscroll::{
         Infiniscroll,
@@ -88,6 +94,7 @@ use web::{
         bg,
         MyErrorDomException,
         spawn_rooted,
+        MyErrorJsValue,
     },
     log,
     noworlater::{
@@ -118,6 +125,8 @@ use web_sys::{
     BroadcastChannel,
     MessageEvent,
     IdbKeyRange,
+    PushSubscription,
+    PushSubscriptionOptionsInit,
 };
 use crate::narrowcore::{
     view::Channel,
@@ -126,6 +135,7 @@ use crate::narrowcore::{
         ViewStateId,
     },
     setview::set_view_nav,
+    state::ensure_temp_view,
 };
 
 pub mod narrowcore;
@@ -371,7 +381,7 @@ fn build_add_channel_create(pc: &mut ProcessingContext, state: &State) -> El {
                                     name: Prim::new(pc, data.name),
                                 };
                                 state.0.channels.set(channel_id.clone(), channel);
-                                state.0.temp_view.set(pc, None);
+                                replace_temp_view(pc, &state, TempViewState::AddChannelCreate, None);
                                 set_view_nav(pc, &state, &ViewStateId::Channel(ChannelViewStateId {
                                     id: channel_id,
                                     message: None,
@@ -389,35 +399,143 @@ fn build_add_channel_create(pc: &mut ProcessingContext, state: &State) -> El {
         let state = state.clone();
         let eg = pc.eg();
         move || eg.event(|pc| {
-            state.0.temp_view.set(pc, None);
+            replace_temp_view(pc, &state, TempViewState::AddChannelCreate, None);
         })
     }, outer);
 }
 
 fn build_add_channel_link(pc: &mut ProcessingContext, state: &State) -> El {
+    #[derive(rooting_forms::Form)]
+    struct Data {
+        #[title("Channel ID")]
+        link: String,
+        #[title("Name")]
+        name: String,
+    }
+
+    let form = Data::new_form("");
+    let inner = vbox();
+    let (outer, async_do) = async_area(pc, &inner);
+    inner.ref_extend(form.elements().elements).ref_extend(vec![hbox().extend(vec![
+        //. .
+        space(),
+        button({
+            let state = state.clone();
+            let eg = pc.eg();
+            move || {
+                if let Ok(data) = form.parse() {
+                    async_do({
+                        let state = state.clone();
+                        let eg = eg.clone();
+                        Box::pin(async move {
+                            let channel_id =
+                                bincode::deserialize::<ChannelId>(
+                                    &zbase32::decode_full_bytes_str(
+                                        &data.link,
+                                    ).context("Couldn't parse channel as zbase32")?,
+                                ).context("Couldn't parse channel bytes as bincode")?;
+                            state.0.world.req_post_ret::<ChannelId>(U2SPost::ChannelJoin {
+                                name: data.name.clone(),
+                                id: channel_id.clone(),
+                            }).await?;
+                            eg.event(|pc| {
+                                let channel = Channel {
+                                    id: channel_id.clone(),
+                                    name: Prim::new(pc, data.name),
+                                };
+                                state.0.channels.set(channel_id.clone(), channel);
+                                replace_temp_view(pc, &state, TempViewState::AddChannelLink, None);
+                                set_view_nav(pc, &state, &ViewStateId::Channel(ChannelViewStateId {
+                                    id: channel_id,
+                                    message: None,
+                                }));
+                            });
+                            return Ok(());
+                        })
+                    });
+                }
+            }
+        }).push(el("span").text("Create")),
+        space()
+    ])]);
     return modal("Add channel from link", {
         let state = state.clone();
         let eg = pc.eg();
         move || eg.event(|pc| {
-            state.0.temp_view.set(pc, None);
+            replace_temp_view(pc, &state, TempViewState::AddChannelLink, None);
         })
-    }, dialpad().extend(vec![
-        //. .
-        dialpad_button("Create", "new", {
-            let state = state.clone();
-            let eg = pc.eg();
-            move || eg.event(|pc| {
-                state.0.temp_view.set(pc, Some(TempViewState::AddChannelCreate));
-            })
-        }),
-        dialpad_button("Paste", "text", {
-            let state = state.clone();
-            let eg = pc.eg();
-            move || eg.event(|pc| {
-                state.0.temp_view.set(pc, Some(TempViewState::AddChannelLink));
-            })
+    }, outer);
+}
+
+async fn finish_push_reg(eg: &EventGraph, state: &State, sub: PushSubscription) -> Result<(), String> {
+    let sub_json = sub.to_json().unwrap().as_string().unwrap();
+    state.0.world.req_post(U2SPost::SubscribePush(sub_json)).await?;
+    eg.event(|pc| {
+        state.0.push_reg_state.set(pc, narrowcore::state::PushRegState::Init);
+    });
+    return Ok(());
+}
+
+fn build_setup_push_reg(pc: &mut ProcessingContext, state: &State) -> El {
+    let inner = vbox();
+    let (outer, async_do) = async_area(pc, &inner);
+    inner.ref_extend(
+        vec![
+            el("span").text("Show a popup when you receive messages and aren't using the app?"),
+            hbox().extend(vec![button({
+                let eg = pc.eg();
+                let state = state.clone();
+                move || (*async_do)(Box::pin({
+                    let state = state.clone();
+                    let eg = eg.clone();
+                    async move {
+                        let server_key =
+                            state
+                                .0
+                                .world
+                                .req_get::<Vec<u8>>(U2SGet::GetPushPubKey)
+                                .await
+                                .context("Error retrieving push reg server key from server")?;
+                        let js_server_key = Uint8Array::new_with_length(server_key.len() as u32);
+                        js_server_key.copy_from(&server_key);
+                        let sub =
+                            PushSubscription::from(
+                                JsFuture::from(
+                                    state
+                                        .0
+                                        .swreg
+                                        .push_manager()
+                                        .unwrap()
+                                        .subscribe_with_options(
+                                            PushSubscriptionOptionsInit::new()
+                                                .user_visible_only(true)
+                                                .application_server_key(Some(&JsValue::from(js_server_key))),
+                                        )
+                                        .unwrap(),
+                                )
+                                    .await
+                                    .context("Error setting up registration")?,
+                            );
+                        finish_push_reg(&eg, &state, sub).await?;
+                        return Ok(());
+                    }
+                }))
+            }).text("Enable"), button({
+                let eg = pc.eg();
+                let state = state.clone();
+                move || eg.event(|pc| {
+                    state.0.push_reg_state.set(pc, narrowcore::state::PushRegState::Disabled);
+                })
+            }).text("Disable")])
+        ],
+    );
+    return modal("Enable notifications", {
+        let state = state.clone();
+        let eg = pc.eg();
+        move || eg.event(|pc| {
+            state.0.push_reg_state.set(pc, narrowcore::state::PushRegState::Disabled);
         })
-    ]));
+    }, outer);
 }
 
 fn build_add_channel(pc: &mut ProcessingContext, state: &State) -> El {
@@ -425,7 +543,7 @@ fn build_add_channel(pc: &mut ProcessingContext, state: &State) -> El {
         let state = state.clone();
         let eg = pc.eg();
         move || eg.event(|pc| {
-            state.0.temp_view.set(pc, None);
+            replace_temp_view(pc, &state, TempViewState::AddChannel, None);
         })
     }, dialpad().extend(vec![
         //. .
@@ -433,14 +551,14 @@ fn build_add_channel(pc: &mut ProcessingContext, state: &State) -> El {
             let state = state.clone();
             let eg = pc.eg();
             move || eg.event(|pc| {
-                state.0.temp_view.set(pc, Some(TempViewState::AddChannelCreate));
+                replace_temp_view(pc, &state, TempViewState::AddChannel, Some(TempViewState::AddChannelCreate));
             })
         }),
         dialpad_button("Paste", "text", {
             let state = state.clone();
             let eg = pc.eg();
             move || eg.event(|pc| {
-                state.0.temp_view.set(pc, Some(TempViewState::AddChannelLink));
+                replace_temp_view(pc, &state, TempViewState::AddChannel, Some(TempViewState::AddChannelLink));
             })
         })
     ]));
@@ -482,7 +600,7 @@ fn build_channels(pc: &mut ProcessingContext, state: &State) -> El {
             let state = state.clone();
             let eg = pc.eg();
             move || eg.event(|pc| {
-                state.0.temp_view.set(pc, Some(TempViewState::AddChannel));
+                state.0.temp_view.push(pc, TempViewState::AddChannel);
             })
         }).push(icon("add"))]),
         vscroll().push(list)
@@ -709,42 +827,82 @@ fn build_messages(pc: &mut ProcessingContext, state: &State, messages_view_state
 }
 
 fn build_main(pc: &mut ProcessingContext, state: &State) -> El {
-    return stack().extend(vec![
-        //. .
-        group().own(|e| link!(
-            //. .
-            (pc = pc), (view_state = state.0.view.clone()), (), (e = e.weak(), state = state.clone()) {
-                let e = e.upgrade()?;
-                e.ref_clear();
-                match &*view_state.borrow() {
-                    ViewState::Channels => {
-                        e.ref_push(build_channels(pc, state));
-                    },
-                    ViewState::Messages(messages_view_state) => {
-                        e.ref_push(build_messages(pc, state, &messages_view_state));
-                    },
-                }
-            })),
-        group().own(|e| link!(
-            //. .
-            (pc = pc), (temp_view_state = state.0.temp_view.clone()), (), (e = e.weak(), state = state.clone()) {
-                let e = e.upgrade()?;
-                if let Some(temp_view_state) = &*temp_view_state.borrow() {
-                    e.ref_clear();
-                    match temp_view_state {
-                        TempViewState::AddChannel => {
-                            e.ref_push(build_add_channel(pc, state));
+    return stack()
+        .own(
+            |_| link!(
+                (pc = pc),
+                (push_reg_state = state.0.push_reg_state.clone()),
+                (),
+                (state = state.clone(), setup = Cell::new(None)) {
+                    match *push_reg_state.borrow() {
+                        narrowcore::state::PushRegState::Disabled | narrowcore::state::PushRegState::Init => {
+                            setup.set(None);
+                            replace_temp_view(pc, state, TempViewState::SetupPushReg, None);
                         },
-                        TempViewState::AddChannelCreate => {
-                            e.ref_push(build_add_channel_create(pc, state));
-                        },
-                        TempViewState::AddChannelLink => {
-                            e.ref_push(build_add_channel_link(pc, state));
+                        narrowcore::state::PushRegState::Uninit => {
+                            setup.set(Some(spawn_rooted("Checking notification registration", {
+                                let state = state.clone();
+                                let eg = pc.eg();
+                                async move {
+                                    let sub =
+                                        JsFuture::from(
+                                            state.0.swreg.push_manager().unwrap().get_subscription().unwrap(),
+                                        )
+                                            .await
+                                            .unwrap();
+                                    if sub.is_null() {
+                                        eg.event(|pc| {
+                                            ensure_temp_view(pc, &state, TempViewState::SetupPushReg);
+                                        });
+                                        return Ok(());
+                                    } else {
+                                        let sub = PushSubscription::from(sub);
+                                        finish_push_reg(&eg, &state, sub).await?;
+                                        return Ok(());
+                                    }
+                                }
+                            })));
                         },
                     }
                 }
-            }))
-    ]);
+            ),
+        )
+        .extend(vec![
+            //. .
+            group().own(|e| link!(
+                //. .
+                (pc = pc), (view_state = state.0.view.clone()), (), (e = e.weak(), state = state.clone()) {
+                    let e = e.upgrade()?;
+                    e.ref_clear();
+                    match &*view_state.borrow() {
+                        ViewState::Channels => {
+                            e.ref_push(build_channels(pc, state));
+                        },
+                        ViewState::Messages(messages_view_state) => {
+                            e.ref_push(build_messages(pc, state, &messages_view_state));
+                        },
+                    }
+                })),
+            stack().bind_list(pc, &state.0.temp_view, {
+                let state = state.clone();
+                move |pc, s| {
+                    match s {
+                        TempViewState::SetupPushReg => {
+                            return build_setup_push_reg(pc, &state);
+                        },
+                        TempViewState::AddChannel => {
+                            return build_add_channel(pc, &state);
+                        },
+                        TempViewState::AddChannelCreate => {
+                            return build_add_channel_create(pc, &state);
+                        },
+                        TempViewState::AddChannelLink => {
+                            return build_add_channel_link(pc, &state);
+                        },
+                    }
+                }
+            })
+        ]);
 }
 
 fn build_auth(pc: &mut ProcessingContext, state: &State) -> El {
@@ -788,11 +946,17 @@ fn main() {
     set_root(vec![async_block("init", async move {
         panic::set_hook(Box::new(console_error_panic_hook::hook));
         let db = dbmodel::new_db().await?;
-        serviceworker::install().await?;
+        let swreg = serviceworker::install().await?;
         let eg = lunk::EventGraph::new();
         return Ok(eg.event(|pc| {
             let world = World::new();
-            let state = State::new(pc, db, &world);
+            let state = State::new(pc, db, swreg, &world);
+            {
+                let mut sending = state.0.sending.borrow_mut();
+                if sending.is_none() {
+                    *sending = Some(spawn_sender(&state));
+                }
+            }
             match (|| {
                 let search =
                     window()
